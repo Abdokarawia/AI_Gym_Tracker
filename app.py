@@ -3,31 +3,37 @@ AI Gym Tracker — Streamlit Real-Time App
 Uses streamlit-webrtc for true browser-side web cam (works on Streamlit Cloud)
 Supports: Squat · Push-Up · Pull-Up · Jumping Jack · Russian Twist
 
-CHANGES in this version:
+FIXES in this version:
 ─────────────────────────────────────────────────────────────────────────────
-1. Error History Panel — sidebar section showing per-rep form errors with
-   timestamps, angle values, and feedback messages. Scrollable, auto-updated,
-   resets on exercise change or counter reset.
-
-2. Wrong Exercise Warning — large full-width overlay banner displayed when the
-   detected pose angle is inconsistent with the selected exercise. Shows the
-   detected exercise name and prompts the user to correct their position.
-─────────────────────────────────────────────────────────────────────────────
-ORIGINAL FIXES:
 1. Python 3.12+ / aioice asyncio shutdown crash patched (NoneType event loop).
-2. Correct ICE config for streamlit-webrtc 0.64.5 + aioice 0.10.2.
+   aioice's pending STUN-retry TimerHandles fire after the asyncio UDP
+   transport's _loop is already None.  We monkey-patch _fatal_error to discard
+   those harmless errors instead of raising AttributeError.
+
+2. Correct ICE config for streamlit-webrtc 0.64.5 + aioice 0.10.2:
+   • aioice only uses ONE stun_server and ONE turn_server (first-match wins).
+   • server_rtc_configuration  → aiortc RTCConfiguration object (Python side).
+     Streamlit Cloud has direct internet access so STUN is enough here, but we
+     also add the TCP TURN as a single-entry fallback for aioice.
+   • frontend_rtc_configuration → TypedDict / plain dict (browser side).
+     The browser's native WebRTC handles multiple servers and ?transport=tcp
+     properly, so we give it the full list including all UDP+TCP TURN URLs.
+   • rtc_configuration is intentionally NOT set — using the split approach
+     avoids the shared-config bug that sends the wrong type to each side.
+
 3. TURN credentials loaded from st.secrets / env vars with open-relay fallback.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
 # ── Asyncio / aioice Python-3.12+ shutdown patch ─────────────────────────────
+# Must run BEFORE any streamlit_webrtc / aioice import.
 import asyncio.selector_events as _sel
 
 _orig_fatal = _sel._SelectorDatagramTransport._fatal_error  # type: ignore[attr-defined]
 
 def _patched_fatal_error(self, exc, message="Fatal error on transport"):
     if self._loop is None:
-        return
+        return  # event loop already gone — discard harmless cleanup error
     try:
         _orig_fatal(self, exc, message)
     except Exception:
@@ -36,7 +42,6 @@ def _patched_fatal_error(self, exc, message="Fatal error on transport"):
 _sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error  # type: ignore[attr-defined]
 # ─────────────────────────────────────────────────────────────────────────────
 
-import time as _time
 import streamlit as st
 import cv2
 import numpy as np
@@ -85,70 +90,6 @@ body, .stApp { background-color: #f5f6fa; color: #1a1a2e; }
 .score-bar-bg { background:#e5e7eb; border-radius:8px; height:14px; margin:6px 0; }
 .score-bar-fill { background:#16a34a; height:14px; border-radius:8px; }
 h1 { color:#16a34a !important; }
-
-/* ── Error History Panel ── */
-.err-panel-header {
-    display:flex; align-items:center; justify-content:space-between;
-    margin-bottom:8px;
-}
-.err-panel-title {
-    font-size:0.85rem; font-weight:700; color:#374151;
-    letter-spacing:1px; text-transform:uppercase;
-}
-.err-count-badge {
-    background:#fee2e2; color:#b91c1c; font-size:0.75rem;
-    font-weight:700; padding:2px 8px; border-radius:999px;
-    border:1px solid #fca5a5;
-}
-.err-count-badge-ok {
-    background:#dcfce7; color:#15803d; font-size:0.75rem;
-    font-weight:700; padding:2px 8px; border-radius:999px;
-    border:1px solid #86efac;
-}
-.err-item {
-    background:#fef9f9;
-    border-left:3px solid #ef4444;
-    border-radius:0 8px 8px 0;
-    padding:8px 12px;
-    margin-bottom:6px;
-    font-size:0.82rem;
-}
-.err-item-meta {
-    display:flex; justify-content:space-between;
-    font-size:0.75rem; color:#9ca3af; margin-bottom:2px;
-}
-.err-item-msg { color:#1f2937; font-weight:600; }
-.err-item-angle { color:#dc2626; font-size:0.75rem; margin-top:2px; }
-.err-empty {
-    text-align:center; padding:14px 0;
-    color:#6b7280; font-size:0.82rem;
-    font-style:italic;
-}
-
-/* ── Wrong Exercise Warning Banner ── */
-.wrong-ex-banner {
-    background:#fff7ed;
-    border:2px solid #f97316;
-    border-radius:14px;
-    padding:20px 24px;
-    margin-bottom:18px;
-    text-align:center;
-    animation: pulse-border 1.5s ease-in-out infinite;
-}
-@keyframes pulse-border {
-    0%, 100% { border-color:#f97316; box-shadow:0 0 0 0 rgba(249,115,22,0.4); }
-    50%       { border-color:#ea580c; box-shadow:0 0 0 6px rgba(249,115,22,0.0); }
-}
-.wrong-ex-icon   { font-size:2.4rem; line-height:1; margin-bottom:6px; }
-.wrong-ex-title  { font-size:1.25rem; font-weight:800; color:#9a3412; margin-bottom:6px; }
-.wrong-ex-body   { font-size:0.95rem; color:#7c2d12; line-height:1.5; margin-bottom:10px; }
-.wrong-ex-pill   {
-    display:inline-block;
-    background:#fef3c7; color:#92400e;
-    border:1px solid #fcd34d;
-    border-radius:8px; padding:6px 16px;
-    font-size:0.88rem; font-weight:600;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -167,15 +108,40 @@ def ensure_model():
 ensure_model()
 
 # ── ICE / TURN configuration ──────────────────────────────────────────────────
-# Metered TURN credentials (free tier — 500 MB/month)
-# NOTE: free plan hostname is standard.relay.metered.ca (not global.*)
-_TURN_HOST = "standard.relay.metered.ca"
-_TURN_USER = "dd7cff0dfdcde374ab963d547"
-_TURN_PASS = "kyICDSv5DKWVzX2"
+#
+# streamlit-webrtc 0.64.5 exposes THREE separate config params:
+#
+#   server_rtc_configuration   → aiortc RTCConfiguration (Python/aioice)
+#   frontend_rtc_configuration → TypedDict / plain dict  (browser WebRTC)
+#   rtc_configuration          → sets BOTH (use only if types match, they don't)
+#
+# aioice 0.10.2 limitation: connection_kwargs() only uses the FIRST stun_server
+# and the FIRST turn_server it encounters when iterating iceServers.  Extra
+# entries are silently skipped.  So we give the server side one optimised entry.
+#
+# The browser's native WebRTC has no such limitation — it handles the full list
+# including multiple TURN servers and ?transport=tcp properly.
+#
+# To use your own TURN server, set these in Streamlit Cloud → App settings → Secrets:
+#   TURN_SERVER     = "your-host.metered.ca"
+#   TURN_USERNAME   = "your-user"
+#   TURN_CREDENTIAL = "your-credential"
 
-# Python/aioice side — aioice only uses the FIRST stun + FIRST turn entry
+def _secret(key: str, fallback: str) -> str:
+    """Read from st.secrets, then os.environ, then fallback."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.environ.get(key, fallback)
+
+_TURN_HOST = _secret("TURN_SERVER",     "openrelay.metered.ca")
+_TURN_USER = _secret("TURN_USERNAME",   "openrelayproject")
+_TURN_PASS = _secret("TURN_CREDENTIAL", "openrelayproject")
+
+# Python / aioice side — one STUN + one TURN (TCP on 443, punches through firewalls)
+# aioice only uses the first match per scheme, so one well-chosen entry is enough.
 SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
-    RTCIceServer(urls=["stun:stun.relay.metered.ca:80"]),
+    RTCIceServer(urls=[f"stun:stun.l.google.com:19302"]),
     RTCIceServer(
         urls=[f"turn:{_TURN_HOST}:443?transport=tcp"],
         username=_TURN_USER,
@@ -183,18 +149,25 @@ SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
     ),
 ])
 
-# Browser side — native WebRTC handles the full list correctly
+# Browser side — full list; native WebRTC handles all of them correctly.
+# UDP port 80  → fastest when allowed
+# UDP port 443 → often open even on restrictive networks
+# TCP port 443 → tunnels through firewalls that block UDP entirely
 FRONTEND_RTC_CONFIG = RTCConfiguration({
     "iceServers": [
-        {"urls": "stun:stun.relay.metered.ca:80"},
-        {"urls": "stun:stun.l.google.com:19302"},
-        {"urls": "stun:stun1.l.google.com:19302"},
+        {
+            "urls": [
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302",
+                "stun:stun2.l.google.com:19302",
+                "stun:stun3.l.google.com:19302",
+            ]
+        },
         {
             "urls": [
                 f"turn:{_TURN_HOST}:80",
-                f"turn:{_TURN_HOST}:80?transport=tcp",
                 f"turn:{_TURN_HOST}:443",
-                f"turns:{_TURN_HOST}:443?transport=tcp",
+                f"turn:{_TURN_HOST}:443?transport=tcp",
             ],
             "username":   _TURN_USER,
             "credential": _TURN_PASS,
@@ -429,50 +402,6 @@ def draw_hud(frame, res, ex_title):
         cv2.putText(frame, fb, (W//2-fw//2,fy2-7), FONT, 0.5, (0,  0,  0),  3, cv2.LINE_AA)
         cv2.putText(frame, fb, (W//2-fw//2,fy2-7), FONT, 0.5, (255,255,255),1, cv2.LINE_AA)
 
-
-# ── Wrong-exercise detector ───────────────────────────────────────────────────
-# Each exercise produces angles in a characteristic range.
-# These are the *typical operating windows* of the measured angle for each exercise.
-# If the live angle is firmly outside the selected exercise's window, we flag it.
-EXERCISE_ANGLE_WINDOWS = {
-    'Squat':         (55,  175),   # knee angle: deep squat ~ 60°, standing ~170°
-    'Push-Up':       (50,  170),   # elbow angle: low ~60°, top ~160°
-    'Pull-Up':       (20,  160),   # elbow angle: chin over bar ~25°, hang ~155°
-    'Jumping Jack':  (15,  165),   # shoulder-hip-wrist angle sweeps full range
-    'Russian Twist': (0,   120),   # lateral displacement value, not a true angle
-}
-
-def detect_wrong_exercise(selected: str, angle: float) -> str | None:
-    """
-    Returns the most likely correct exercise name when the measured angle
-    is inconsistent with the selected exercise. Returns None when everything
-    looks fine or when we cannot determine the mismatch confidently.
-    """
-    if angle <= 0:
-        return None
-
-    lo, hi = EXERCISE_ANGLE_WINDOWS[selected]
-    # Add a generous tolerance buffer so we only warn on clear mismatches
-    TOLERANCE = 20
-    if (lo - TOLERANCE) <= angle <= (hi + TOLERANCE):
-        return None  # angle is plausible for selected exercise — no warning
-
-    # Find which exercise this angle fits best
-    best_match = None
-    best_overlap = float('inf')
-    for name, (wlo, whi) in EXERCISE_ANGLE_WINDOWS.items():
-        if name == selected:
-            continue
-        if wlo <= angle <= whi:
-            # Distance from centre of window — closer = better match
-            centre = (wlo + whi) / 2
-            dist   = abs(angle - centre)
-            if dist < best_overlap:
-                best_overlap = dist
-                best_match   = name
-    return best_match
-
-
 # ── Shared gym state ──────────────────────────────────────────────────────────
 class GymState:
     def __init__(self):
@@ -486,12 +415,6 @@ class GymState:
         self._mp           = None
         self._landmarker   = None
 
-        # ── NEW: error history tracking ──────────────────────────────────────
-        # Each entry: {rep, time_s, feedback, angle, exercise}
-        self.error_history   = []
-        self._session_start  = None
-        self._last_err_rep   = -1   # avoid duplicate entries for the same rep
-
     def set_exercise(self, ex):
         with self.lock:
             if ex != self.exercise:
@@ -500,10 +423,6 @@ class GymState:
                 self.result   = {'count':0,'stage':'','feedback':'Get in position!',
                                  'angle':0,'form_score':0}
                 self._close_landmarker()
-                # Reset error history when exercise changes
-                self.error_history  = []
-                self._session_start = None
-                self._last_err_rep  = -1
 
     def _close_landmarker(self):
         if self._landmarker:
@@ -537,74 +456,21 @@ class GymState:
             rgb    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             det    = landmarker.detect(mp_img)
-
             if det.pose_landmarks:
                 lms = det.pose_landmarks[0]
                 if self.show_skeleton:
                     draw_skeleton(frame_bgr, lms, W, H)
                 self.result = self.analyzer.analyze(lms, W, H)
-
-                # ── NEW: log form errors to history ──────────────────────────
-                self._record_error_if_needed()
-
             else:
                 self.result = {**self.result,
                                'feedback': 'No pose — step back & stand tall'}
-
             draw_hud(frame_bgr, self.result, self.exercise)
             return frame_bgr
-
-    def _record_error_if_needed(self):
-        """
-        Called (inside the lock) after every successful pose detection.
-        Appends an entry to error_history when a rep completes with poor form.
-        Conditions for logging:
-          - At least one rep has been completed
-          - Feedback message signals a problem (no 🔥, not a neutral message)
-          - We haven't already logged this rep number
-        """
-        if self._session_start is None:
-            self._session_start = _time.time()
-
-        res      = self.result
-        feedback = res.get('feedback', '')
-        rep_num  = res.get('count', 0)
-
-        # Neutral / success messages we do NOT log as errors
-        GOOD_PHRASES = ('🔥', 'Get in position', 'Ready', 'Stand tall',
-                        'Push up', 'Lower slowly', 'Keep going')
-        is_good = any(p in feedback for p in GOOD_PHRASES)
-
-        if rep_num > 0 and not is_good and rep_num != self._last_err_rep:
-            elapsed  = int(_time.time() - self._session_start)
-            self._last_err_rep = rep_num
-            self.error_history.append({
-                'rep':      rep_num,
-                'time_s':   elapsed,
-                'feedback': feedback,
-                'angle':    int(res.get('angle') or 0),
-                'exercise': self.exercise,
-            })
-            # Keep the list bounded (last 50 errors)
-            if len(self.error_history) > 50:
-                self.error_history = self.error_history[-50:]
-
-    def reset(self):
-        """Full reset of reps, stage, history and error log."""
-        with self.lock:
-            self.analyzer.rc.reset()
-            self.result = {'count':0,'stage':'','feedback':'Ready!',
-                           'angle':0,'form_score':0}
-            self.error_history  = []
-            self._session_start = None
-            self._last_err_rep  = -1
-
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if 'gym_state' not in st.session_state:
     st.session_state.gym_state = GymState()
 gym = st.session_state.gym_state
-
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -619,53 +485,17 @@ with st.sidebar:
     mirror        = st.checkbox("Mirror Webcam",  value=True)
     st.markdown("---")
     if st.button("🔄 Reset Counter", use_container_width=True):
-        gym.reset()
+        with gym.lock:
+            gym.analyzer.rc.reset()
+            gym.result = {'count':0,'stage':'','feedback':'Ready!',
+                          'angle':0,'form_score':0}
+        st.rerun()
     st.markdown("---")
     st.markdown("**Exercises:**\n🦵 Squat · 💪 Push-Up\n🏋️ Pull-Up · 🙆 Jumping Jack\n🔄 Russian Twist")
-
-    # ── NEW: Error History Panel ──────────────────────────────────────────────
-    st.markdown("---")
-    errs = list(gym.error_history)   # snapshot (thread-safe copy)
-    err_count = len(errs)
-
-    badge_cls  = "err-count-badge"    if err_count > 0 else "err-count-badge-ok"
-    badge_text = str(err_count)       if err_count > 0 else "0"
-
-    st.markdown(
-        f"""<div class="err-panel-header">
-              <span class="err-panel-title">Form Errors</span>
-              <span class="{badge_cls}">{badge_text}</span>
-            </div>""",
-        unsafe_allow_html=True,
-    )
-
-    if err_count == 0:
-        st.markdown(
-            '<div class="err-empty">No errors yet — keep it up!</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        # Show most recent errors first (reversed)
-        for e in reversed(errs):
-            mins, secs = divmod(e['time_s'], 60)
-            ts = f"{mins}:{secs:02d}"
-            st.markdown(
-                f"""<div class="err-item">
-                      <div class="err-item-meta">
-                        <span>Rep {e['rep']}</span>
-                        <span>{ts}</span>
-                      </div>
-                      <div class="err-item-msg">{e['feedback']}</div>
-                      <div class="err-item-angle">Angle: {e['angle']}°</div>
-                    </div>""",
-                unsafe_allow_html=True,
-            )
-
 
 gym.set_exercise(exercise)
 gym.show_skeleton = show_skeleton
 gym.mirror        = mirror
-
 
 # ── Main layout ───────────────────────────────────────────────────────────────
 st.title("💪 AI Gym Tracker — Real-Time")
@@ -674,7 +504,6 @@ st.caption("MediaPipe Pose Estimation · Select exercise · Allow camera when pr
 col_vid, col_stats = st.columns([3, 1])
 
 with col_stats:
-    warn_ph   = st.empty()   # NEW: wrong-exercise warning placeholder (top)
     rep_ph    = st.empty()
     stage_ph  = st.empty()
     angle_ph  = st.empty()
@@ -682,45 +511,14 @@ with col_stats:
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
     end_btn_ph = st.empty()
 
-
-def _format_wrong_exercise_banner(selected: str, detected: str) -> str:
-    """Return the HTML for the big warning banner."""
-    return f"""
-<div class="wrong-ex-banner">
-  <div class="wrong-ex-icon">⚠️</div>
-  <div class="wrong-ex-title">Wrong Exercise!</div>
-  <div class="wrong-ex-body">
-    You selected <strong>{selected}</strong> but your body position
-    suggests a different exercise.
-  </div>
-  <div class="wrong-ex-pill">Detected: <strong>{detected}</strong></div>
-  <div style="margin-top:10px; font-size:0.82rem; color:#9a3412;">
-    Please reposition for <strong>{selected}</strong><br>
-    or change exercise in the sidebar.
-  </div>
-</div>
-"""
-
-
 def render_stats():
-    res    = gym.result
-    cnt    = res.get('count', 0)
-    s      = (res.get('stage', '') or 'READY').upper()
-    ang    = int(res.get('angle') or 0)
-    fb     = res.get('feedback', '')
-    sc100  = res.get('form_score', 0)
-    sc     = '#16a34a' if s in ('UP', 'READY') else '#2563eb'
-
-    # ── NEW: wrong-exercise warning ───────────────────────────────────────────
-    wrong = detect_wrong_exercise(exercise, float(ang)) if ang > 0 else None
-    if wrong:
-        warn_ph.markdown(
-            _format_wrong_exercise_banner(exercise, wrong),
-            unsafe_allow_html=True,
-        )
-    else:
-        warn_ph.empty()
-    # ─────────────────────────────────────────────────────────────────────────
+    res   = gym.result
+    cnt   = res.get('count', 0)
+    s     = (res.get('stage', '') or 'READY').upper()
+    ang   = int(res.get('angle') or 0)
+    fb    = res.get('feedback', '')
+    sc100 = res.get('form_score', 0)
+    sc    = '#16a34a' if s in ('UP', 'READY') else '#2563eb'
 
     rep_ph.markdown(
         f'<div class="metric-card">'
@@ -749,9 +547,7 @@ def render_stats():
         f'End Exercise (Score: {sc100})</a>',
         unsafe_allow_html=True)
 
-
 render_stats()
-
 
 # ── Webcam mode ───────────────────────────────────────────────────────────────
 if mode.startswith("📹"):
@@ -772,8 +568,9 @@ if mode.startswith("📹"):
 
     with col_vid:
         ctx = webrtc_streamer(
-            key="gym-tracker",
+            key=f"gym-{exercise}",
             mode=WebRtcMode.SENDRECV,
+            # ↓ Split config: correct type for each side
             server_rtc_configuration=SERVER_RTC_CONFIG,
             frontend_rtc_configuration=FRONTEND_RTC_CONFIG,
             video_frame_callback=video_frame_callback,
@@ -791,11 +588,10 @@ if mode.startswith("📹"):
         )
 
     if ctx.state.playing:
-        import time as _loop_time
+        import time
         while ctx.state.playing:
             render_stats()
-            _loop_time.sleep(0.25)
-
+            time.sleep(0.25)
 
 # ── Video upload mode ─────────────────────────────────────────────────────────
 else:
@@ -835,13 +631,11 @@ else:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                analyzer      = ANALYZERS[exercise]()
-                prog          = st.progress(0, "Processing…")
-                preview       = st.empty()
-                last_res      = {'count':0,'stage':'','feedback':'','angle':0}
-                fidx          = 0
-                video_errors  = []   # NEW: collect errors for video mode too
-                _v_last_errep = -1
+                analyzer = ANALYZERS[exercise]()
+                prog     = st.progress(0, "Processing…")
+                preview  = st.empty()
+                last_res = {'count':0,'stage':'','feedback':'','angle':0}
+                fidx     = 0
 
                 while True:
                     ret, frame = cap.read()
@@ -858,26 +652,6 @@ else:
                         if show_skeleton:
                             draw_skeleton(frame, lms, vw, vh)
                         last_res = analyzer.analyze(lms, vw, vh)
-
-                        # ── NEW: log errors in video mode ─────────────────
-                        _fb  = last_res.get('feedback', '')
-                        _rep = last_res.get('count', 0)
-                        GOOD = ('🔥', 'Get in position', 'Ready', 'Stand tall',
-                                'Push up', 'Lower slowly', 'Keep going')
-                        if (_rep > 0
-                                and not any(p in _fb for p in GOOD)
-                                and _rep != _v_last_errep):
-                            _v_last_errep = _rep
-                            _elapsed = int(fidx / fps)
-                            _m, _s   = divmod(_elapsed, 60)
-                            video_errors.append({
-                                'rep':      _rep,
-                                'time_s':   _elapsed,
-                                'feedback': _fb,
-                                'angle':    int(last_res.get('angle') or 0),
-                            })
-                        # ─────────────────────────────────────────────────
-
                     else:
                         last_res = {**last_res,
                                     'feedback': 'No pose detected'}
@@ -896,26 +670,6 @@ else:
                     f"✅ Done! **{last_res['count']} reps** in {fidx} frames.")
                 gym.result = last_res
                 render_stats()
-
-                # ── NEW: show error history for uploaded video ────────────────
-                if video_errors:
-                    st.markdown("#### ⚠️ Form Errors Detected")
-                    for e in video_errors:
-                        mins, secs = divmod(e['time_s'], 60)
-                        ts = f"{mins}:{secs:02d}"
-                        st.markdown(
-                            f"""<div class="err-item">
-                                  <div class="err-item-meta">
-                                    <span>Rep {e['rep']}</span>
-                                    <span>{ts}</span>
-                                  </div>
-                                  <div class="err-item-msg">{e['feedback']}</div>
-                                  <div class="err-item-angle">Angle: {e['angle']}°</div>
-                                </div>""",
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    st.success("🏆 Perfect form — no errors recorded!")
 
                 hist = list(analyzer.rc.history)
                 if hist:
