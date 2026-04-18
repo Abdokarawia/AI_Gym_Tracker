@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d0f12; font-family: 'DM Sans', sans-serif; color: #e8eaf0; overflow: hidden; }
+
+  #container { position: relative; width: 100%; }
+
+  /* Live input video — hidden, just for capture */
+  #inputVideo { display: none; }
+
+  /* Output canvas — shows annotated frame from Python */
+  #outputCanvas {
+    width: 100%;
+    border-radius: 12px;
+    display: block;
+    border: 2px solid #1e2229;
+    background: #13161c;
+    min-height: 360px;
+  }
+
+  /* Placeholder shown before camera starts */
+  #placeholder {
+    width: 100%;
+    height: 360px;
+    border-radius: 12px;
+    border: 2px dashed #2a2f3a;
+    background: #13161c;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: #4b5563;
+    font-size: 0.9rem;
+  }
+  #placeholder svg { opacity: 0.4; }
+
+  #controls {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  button {
+    padding: 10px 28px;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+    border: none;
+    transition: all 0.2s;
+    letter-spacing: 0.5px;
+  }
+  #startBtn { background: #39ff7e; color: #0d0f12; }
+  #startBtn:hover { background: #2de070; transform: scale(1.02); }
+  #stopBtn  { background: #1e2229; color: #e8eaf0; border: 1px solid #2a2f3a; display: none; }
+  #stopBtn:hover { background: #2a2f3a; }
+
+  #statusBar {
+    margin-top: 8px;
+    text-align: center;
+    font-size: 0.78rem;
+    color: #4b5563;
+    letter-spacing: 0.5px;
+    min-height: 20px;
+  }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #39ff7e; margin-right: 5px;
+    animation: blink 1s infinite;
+  }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+  #fpsBar {
+    position: absolute;
+    top: 10px; right: 14px;
+    background: rgba(13,15,18,0.8);
+    border: 1px solid #1e2229;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 0.7rem;
+    color: #f59e0b;
+    font-weight: 700;
+    display: none;
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="placeholder">
+    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#4b5563" stroke-width="1.5">
+      <path d="M15 10l4.553-2.276A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/>
+    </svg>
+    <span>Click <b style="color:#39ff7e">Start Camera</b> to begin</span>
+    <span style="font-size:0.75rem;color:#374151">Allow camera access when prompted</span>
+  </div>
+  <canvas id="outputCanvas" style="display:none;"></canvas>
+  <div id="fpsBar">0.0 FPS</div>
+</div>
+
+<div id="controls">
+  <button id="startBtn" onclick="startCam()">▶ Start Camera</button>
+  <button id="stopBtn"  onclick="stopCam()">■ Stop</button>
+</div>
+<div id="statusBar">Ready — click Start Camera to begin</div>
+
+<video id="inputVideo" autoplay playsinline muted></video>
+
+<script>
+// ── Streamlit component bootstrap ────────────────────────────────────────────
+// This script is served from a declare_component() local path, so
+// window.Streamlit is always available via the parent frame injection.
+
+(function() {
+
+const video    = document.getElementById('inputVideo');
+const canvas   = document.getElementById('outputCanvas');
+const ctx      = canvas.getContext('2d');
+const placeholder = document.getElementById('placeholder');
+const statusEl = document.getElementById('statusBar');
+const fpsBar   = document.getElementById('fpsBar');
+
+let stream     = null;
+let rafHandle  = null;
+let running    = false;
+let lastSentMs = 0;
+const SEND_INTERVAL_MS = 120;  // ~8 fps to server — keeps Streamlit responsive
+
+// FPS display
+let fpsFrames = 0, fpsLast = performance.now();
+
+// ── Receive annotated frames from Python via component args ──────────────────
+// Python calls the component with args = {"annotated": "<base64 jpeg>"}
+// Streamlit injects these as events we can listen to.
+function onStreamlitRender(event) {
+  const data = event.detail;
+  if (!data || !data.args) return;
+  const ann = data.args.annotated;
+  if (ann && ann.length > 100) {
+    const img = new Image();
+    img.onload = () => {
+      canvas.width  = img.naturalWidth  || 640;
+      canvas.height = img.naturalHeight || 480;
+      ctx.drawImage(img, 0, 0);
+
+      // FPS counter
+      fpsFrames++;
+      const now = performance.now();
+      if (now - fpsLast >= 2000) {
+        const fps = (fpsFrames / ((now - fpsLast) / 1000)).toFixed(1);
+        fpsBar.textContent = fps + ' FPS';
+        fpsFrames = 0; fpsLast = now;
+      }
+    };
+    img.src = ann;
+  }
+}
+
+// Register Streamlit render event
+document.addEventListener('streamlit:render', onStreamlitRender);
+
+// ── Capture loop ─────────────────────────────────────────────────────────────
+function captureLoop() {
+  if (!running) return;
+  rafHandle = requestAnimationFrame(captureLoop);
+
+  const now = performance.now();
+  if (now - lastSentMs < SEND_INTERVAL_MS) return;
+  if (video.readyState < 2) return;
+
+  lastSentMs = now;
+
+  // Draw raw video to offscreen canvas, compress to JPEG
+  const off = document.createElement('canvas');
+  off.width  = video.videoWidth  || 640;
+  off.height = video.videoHeight || 480;
+  const offCtx = off.getContext('2d');
+  offCtx.drawImage(video, 0, 0);
+  const b64 = off.toDataURL('image/jpeg', 0.72);
+
+  // Send to Python — triggers Streamlit rerun
+  Streamlit.setComponentValue(b64);
+}
+
+// ── Start / stop ─────────────────────────────────────────────────────────────
+async function startCam() {
+  try {
+    statusEl.innerHTML = 'Requesting camera…';
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    // Show canvas, hide placeholder
+    placeholder.style.display  = 'none';
+    canvas.style.display       = 'block';
+    fpsBar.style.display       = 'block';
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('stopBtn').style.display  = 'inline-block';
+
+    running = true;
+    statusEl.innerHTML = '<span class="dot"></span>Live · processing with AI…';
+    captureLoop();
+  } catch(e) {
+    statusEl.textContent = '❌ Camera error: ' + e.message;
+    console.error('Camera error:', e);
+  }
+}
+
+function stopCam() {
+  running = false;
+  if (rafHandle) cancelAnimationFrame(rafHandle);
+  if (stream)    stream.getTracks().forEach(t => t.stop());
+  stream = null;
+
+  placeholder.style.display  = 'flex';
+  canvas.style.display       = 'none';
+  fpsBar.style.display       = 'none';
+  document.getElementById('startBtn').style.display = 'inline-block';
+  document.getElementById('stopBtn').style.display  = 'none';
+  statusEl.textContent = 'Camera stopped.';
+
+  // Tell Python camera stopped
+  Streamlit.setComponentValue(null);
+}
+
+// Expose to onclick handlers
+window.startCam = startCam;
+window.stopCam  = stopCam;
+
+// Tell Streamlit the component is ready and set initial height
+Streamlit.setFrameHeight(480 + 70);  // canvas + controls + status
+Streamlit.setComponentReady();
+
+})();
+</script>
+</body>
+</html>
