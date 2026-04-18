@@ -16,6 +16,7 @@ NEW in this version:
 """
 
 # ── Asyncio / aioice Python-3.12+ shutdown patch ─────────────────────────────
+# Must run BEFORE any streamlit_webrtc / aioice import.
 import asyncio.selector_events as _sel
 
 _orig_fatal = _sel._SelectorDatagramTransport._fatal_error  # type: ignore[attr-defined]
@@ -29,6 +30,27 @@ def _patched_fatal_error(self, exc, message="Fatal error on transport"):
         pass
 
 _sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error  # type: ignore[attr-defined]
+
+# ── streamlit_webrtc shutdown observer patch (Python 3.14 / threading race) ──
+# When ICE disconnects, streamlit_webrtc calls observer.stop() before
+# _polling_thread is started → AttributeError: 'NoneType' has no 'is_alive'.
+# We patch stop() to guard against that race.
+def _patch_webrtc_shutdown():
+    try:
+        from streamlit_webrtc import shutdown as _sw
+        _orig_stop = _sw.SessionShutdownObserver.stop
+        def _safe_stop(self):
+            try:
+                if getattr(self, '_polling_thread', None) is None:
+                    return
+                _orig_stop(self)
+            except AttributeError:
+                pass
+        _sw.SessionShutdownObserver.stop = _safe_stop
+    except Exception:
+        pass  # non-critical, ignore if module layout differs
+
+_patch_webrtc_shutdown()
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -128,7 +150,9 @@ _TURN_USER = _secret("TURN_USERNAME",   "openrelayproject")
 _TURN_PASS = _secret("TURN_CREDENTIAL", "openrelayproject")
 
 SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
-    RTCIceServer(urls=[f"stun:stun.l.google.com:19302"]),
+    # aioice uses the FIRST stun_server only — pick the fastest globally
+    RTCIceServer(urls=["stun:stun.cloudflare.com:3478"]),
+    # TCP-443 TURN as single fallback for aioice (punches through firewalls)
     RTCIceServer(
         urls=[f"turn:{_TURN_HOST}:443?transport=tcp"],
         username=_TURN_USER,
@@ -136,22 +160,38 @@ SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
     ),
 ])
 
+# Browser-side config — native WebRTC handles all entries.
+# Order matters: browser tries them top-to-bottom, fastest first.
+# Cloudflare STUN (anycast, low-latency from MENA/EU) is first.
+# TCP-443 TURN is last resort so UDP is always tried first.
 FRONTEND_RTC_CONFIG = RTCConfiguration({
     "iceServers": [
+        # Cloudflare — anycast, excellent latency from Egypt / Middle East
+        {"urls": ["stun:stun.cloudflare.com:3478"]},
+        # Google STUNs as backup
         {"urls": [
             "stun:stun.l.google.com:19302",
             "stun:stun1.l.google.com:19302",
-            "stun:stun2.l.google.com:19302",
         ]},
+        # TURN UDP (fast path)
         {"urls": [
             f"turn:{_TURN_HOST}:80",
-            f"turn:{_TURN_HOST}:443",
+            f"turn:{_TURN_HOST}:3478",
+        ],
+         "username":   _TURN_USER,
+         "credential": _TURN_PASS,
+        },
+        # TURN TCP-443 (firewall bypass, last resort)
+        {"urls": [
             f"turn:{_TURN_HOST}:443?transport=tcp",
         ],
          "username":   _TURN_USER,
          "credential": _TURN_PASS,
         },
-    ]
+    ],
+    # Give the browser a pre-allocated ICE candidate pool so candidates are
+    # ready the moment the user clicks Start — cuts perceived connection time.
+    "iceCandidatePoolSize": 4,
 })
 
 # ── Pose utilities ────────────────────────────────────────────────────────────
@@ -763,7 +803,12 @@ render_stats()
 if mode.startswith("📹"):
     with col_vid:
         st.markdown("#### 📹 Live Webcam — Real-Time Tracking")
-        st.info("Click **START** → allow camera access → begin exercising!")
+        st.info(
+            "Click **▶ Start Camera** → allow camera access → begin exercising!  \n"
+            "⏳ *First connection takes 5–15 s while ICE candidates are gathered. "
+            "If it stalls beyond 30 s, your network may be blocking UDP — "
+            "the app will automatically fall back to TCP.*"
+        )
 
     def video_frame_callback(frame: VideoFrame) -> VideoFrame:
         img = frame.to_ndarray(format="bgr24")
