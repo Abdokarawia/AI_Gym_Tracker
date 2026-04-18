@@ -167,18 +167,15 @@ def ensure_model():
 ensure_model()
 
 # ── ICE / TURN configuration ──────────────────────────────────────────────────
-def _secret(key: str, fallback: str) -> str:
-    try:
-        return st.secrets[key]
-    except Exception:
-        return os.environ.get(key, fallback)
+# Metered TURN credentials (free tier — 500 MB/month)
+# NOTE: free plan hostname is standard.relay.metered.ca (not global.*)
+_TURN_HOST = "standard.relay.metered.ca"
+_TURN_USER = "dd7cff0dfdcde374ab963d547"
+_TURN_PASS = "kyICDSv5DKWVzX2"
 
-_TURN_HOST = _secret("TURN_SERVER",     "openrelay.metered.ca")
-_TURN_USER = _secret("TURN_USERNAME",   "openrelayproject")
-_TURN_PASS = _secret("TURN_CREDENTIAL", "openrelayproject")
-
+# Python/aioice side — aioice only uses the FIRST stun + FIRST turn entry
 SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
-    RTCIceServer(urls=[f"stun:stun.l.google.com:19302"]),
+    RTCIceServer(urls=["stun:stun.relay.metered.ca:80"]),
     RTCIceServer(
         urls=[f"turn:{_TURN_HOST}:443?transport=tcp"],
         username=_TURN_USER,
@@ -186,21 +183,18 @@ SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
     ),
 ])
 
+# Browser side — native WebRTC handles the full list correctly
 FRONTEND_RTC_CONFIG = RTCConfiguration({
     "iceServers": [
-        {
-            "urls": [
-                "stun:stun.l.google.com:19302",
-                "stun:stun1.l.google.com:19302",
-                "stun:stun2.l.google.com:19302",
-                "stun:stun3.l.google.com:19302",
-            ]
-        },
+        {"urls": "stun:stun.relay.metered.ca:80"},
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
         {
             "urls": [
                 f"turn:{_TURN_HOST}:80",
+                f"turn:{_TURN_HOST}:80?transport=tcp",
                 f"turn:{_TURN_HOST}:443",
-                f"turn:{_TURN_HOST}:443?transport=tcp",
+                f"turns:{_TURN_HOST}:443?transport=tcp",
             ],
             "username":   _TURN_USER,
             "credential": _TURN_PASS,
@@ -797,10 +791,10 @@ if mode.startswith("📹"):
         )
 
     if ctx.state.playing:
-        import time
+        import time as _loop_time
         while ctx.state.playing:
             render_stats()
-            time.sleep(0.25)
+            _loop_time.sleep(0.25)
 
 
 # ── Video upload mode ─────────────────────────────────────────────────────────
