@@ -513,8 +513,14 @@ class EventHistory:
             self._events.clear()
 
 # ── Shared gym state ──────────────────────────────────────────────────────────
+# Bump _GYM_STATE_VERSION whenever GymState gains or removes attributes.
+# The session-state guard below will rebuild the object automatically, which
+# prevents AttributeError crashes when users have a live session during deploy.
+_GYM_STATE_VERSION = 2
+
 class GymState:
     def __init__(self):
+        self._version      = _GYM_STATE_VERSION   # bump to force refresh after deploys
         self.lock          = threading.Lock()
         self.result        = {'count':0,'stage':'','feedback':'Get in position!',
                               'angle':0,'form_score':0}
@@ -612,8 +618,19 @@ class GymState:
             return frame_bgr
 
 # ── Session state ─────────────────────────────────────────────────────────────
-if 'gym_state' not in st.session_state:
+# Version stamp — bump this any time GymState gains new attributes.
+# If the cached object is from an older version it gets replaced cleanly,
+# which fixes the "AttributeError: 'GymState' has no attribute 'X'" crash
+# that occurs on Streamlit Cloud after a hot-reload with a live session.
+
+def _gym_state_is_fresh(obj) -> bool:
+    """Return True only if obj was built by the current GymState definition."""
+    return (isinstance(obj, GymState)
+            and getattr(obj, '_version', 0) == _GYM_STATE_VERSION)
+
+if not _gym_state_is_fresh(st.session_state.get('gym_state')):
     st.session_state.gym_state = GymState()
+
 gym = st.session_state.gym_state
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
