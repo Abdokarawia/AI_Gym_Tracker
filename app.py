@@ -626,7 +626,6 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🔄 Reset Counter", use_container_width=True):
         gym.reset()
-        st.rerun()
     st.markdown("---")
     st.markdown("**Exercises:**\n🦵 Squat · 💪 Push-Up\n🏋️ Pull-Up · 🙆 Jumping Jack\n🔄 Russian Twist")
 
@@ -779,7 +778,7 @@ if mode.startswith("📹"):
 
     with col_vid:
         ctx = webrtc_streamer(
-            key=f"gym-{exercise}",
+            key="gym-tracker",
             mode=WebRtcMode.SENDRECV,
             server_rtc_configuration=SERVER_RTC_CONFIG,
             frontend_rtc_configuration=FRONTEND_RTC_CONFIG,
