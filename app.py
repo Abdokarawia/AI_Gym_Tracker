@@ -4,34 +4,42 @@ Uses streamlit-webrtc for true browser-side web cam (works on Streamlit Cloud)
 Supports: Squat · Push-Up · Pull-Up · Jumping Jack · Russian Twist
 
 FIXES in this version:
-- Python 3.12+ / aioice asyncio shutdown crash patched (NoneType event loop)
-- Added TURN servers (openrelay.metered.ca) for NAT/firewall traversal
-- Added TCP fallback on port 443 for corporate firewalls
-- TURN credentials loaded from env vars (Streamlit secrets) with open fallback
-- Graceful asyncio loop guard to suppress dangling STUN retry callbacks
+─────────────────────────────────────────────────────────────────────────────
+1. Python 3.12+ / aioice asyncio shutdown crash patched (NoneType event loop).
+   aioice's pending STUN-retry TimerHandles fire after the asyncio UDP
+   transport's _loop is already None.  We monkey-patch _fatal_error to discard
+   those harmless errors instead of raising AttributeError.
+
+2. Correct ICE config for streamlit-webrtc 0.64.5 + aioice 0.10.2:
+   • aioice only uses ONE stun_server and ONE turn_server (first-match wins).
+   • server_rtc_configuration  → aiortc RTCConfiguration object (Python side).
+     Streamlit Cloud has direct internet access so STUN is enough here, but we
+     also add the TCP TURN as a single-entry fallback for aioice.
+   • frontend_rtc_configuration → TypedDict / plain dict (browser side).
+     The browser's native WebRTC handles multiple servers and ?transport=tcp
+     properly, so we give it the full list including all UDP+TCP TURN URLs.
+   • rtc_configuration is intentionally NOT set — using the split approach
+     avoids the shared-config bug that sends the wrong type to each side.
+
+3. TURN credentials loaded from st.secrets / env vars with open-relay fallback.
+─────────────────────────────────────────────────────────────────────────────
 """
 
-# ── Asyncio / aioice Python-3.12+ compatibility patch ────────────────────────
-# When streamlit-webrtc stops, it destroys the event loop while aioice still
-# has pending STUN-retry TimerHandles queued.  Those callbacks fire into a
-# half-torn-down transport whose _loop is already None, producing:
-#   AttributeError: 'NoneType' object has no attribute 'call_exception_handler'
-# We monkey-patch asyncio's UDP transport _fatal_error so that it silently
-# swallows the error when the loop is already gone, instead of crashing.
-import asyncio
+# ── Asyncio / aioice Python-3.12+ shutdown patch ─────────────────────────────
+# Must run BEFORE any streamlit_webrtc / aioice import.
 import asyncio.selector_events as _sel
 
 _orig_fatal = _sel._SelectorDatagramTransport._fatal_error  # type: ignore[attr-defined]
 
 def _patched_fatal_error(self, exc, message="Fatal error on transport"):
     if self._loop is None:
-        return          # loop already gone — silently discard
+        return  # event loop already gone — discard harmless cleanup error
     try:
         _orig_fatal(self, exc, message)
     except Exception:
         pass
 
-_sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error          # type: ignore[attr-defined]
+_sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error  # type: ignore[attr-defined]
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -43,6 +51,7 @@ import tempfile
 import threading
 from collections import deque
 from av import VideoFrame
+from aiortc import RTCConfiguration as AioRTCConfiguration, RTCIceServer
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 st.set_page_config(
@@ -98,33 +107,73 @@ def ensure_model():
 
 ensure_model()
 
-# ── TURN / ICE configuration ──────────────────────────────────────────────────
+# ── ICE / TURN configuration ──────────────────────────────────────────────────
+#
+# streamlit-webrtc 0.64.5 exposes THREE separate config params:
+#
+#   server_rtc_configuration   → aiortc RTCConfiguration (Python/aioice)
+#   frontend_rtc_configuration → TypedDict / plain dict  (browser WebRTC)
+#   rtc_configuration          → sets BOTH (use only if types match, they don't)
+#
+# aioice 0.10.2 limitation: connection_kwargs() only uses the FIRST stun_server
+# and the FIRST turn_server it encounters when iterating iceServers.  Extra
+# entries are silently skipped.  So we give the server side one optimised entry.
+#
+# The browser's native WebRTC has no such limitation — it handles the full list
+# including multiple TURN servers and ?transport=tcp properly.
+#
+# To use your own TURN server, set these in Streamlit Cloud → App settings → Secrets:
+#   TURN_SERVER     = "your-host.metered.ca"
+#   TURN_USERNAME   = "your-user"
+#   TURN_CREDENTIAL = "your-credential"
+
 def _secret(key: str, fallback: str) -> str:
+    """Read from st.secrets, then os.environ, then fallback."""
     try:
         return st.secrets[key]
     except Exception:
         return os.environ.get(key, fallback)
 
-_TURN_SERVER     = _secret("TURN_SERVER",     "openrelay.metered.ca")
-_TURN_USERNAME   = _secret("TURN_USERNAME",   "openrelayproject")
-_TURN_CREDENTIAL = _secret("TURN_CREDENTIAL", "openrelayproject")
+_TURN_HOST = _secret("TURN_SERVER",     "openrelay.metered.ca")
+_TURN_USER = _secret("TURN_USERNAME",   "openrelayproject")
+_TURN_PASS = _secret("TURN_CREDENTIAL", "openrelayproject")
 
-RTC_CONFIG = RTCConfiguration({"iceServers": [
-    {"urls": ["stun:stun.l.google.com:19302"]},
-    {"urls": ["stun:stun1.l.google.com:19302"]},
-    {"urls": ["stun:stun2.l.google.com:19302"]},
-    {"urls": ["stun:stun3.l.google.com:19302"]},
-    {"urls": ["stun:stun4.l.google.com:19302"]},
-    {
-        "urls": [
-            f"turn:{_TURN_SERVER}:80",
-            f"turn:{_TURN_SERVER}:443",
-            f"turn:{_TURN_SERVER}:443?transport=tcp",
-        ],
-        "username":   _TURN_USERNAME,
-        "credential": _TURN_CREDENTIAL,
-    },
-]})
+# Python / aioice side — one STUN + one TURN (TCP on 443, punches through firewalls)
+# aioice only uses the first match per scheme, so one well-chosen entry is enough.
+SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
+    RTCIceServer(urls=[f"stun:stun.l.google.com:19302"]),
+    RTCIceServer(
+        urls=[f"turn:{_TURN_HOST}:443?transport=tcp"],
+        username=_TURN_USER,
+        credential=_TURN_PASS,
+    ),
+])
+
+# Browser side — full list; native WebRTC handles all of them correctly.
+# UDP port 80  → fastest when allowed
+# UDP port 443 → often open even on restrictive networks
+# TCP port 443 → tunnels through firewalls that block UDP entirely
+FRONTEND_RTC_CONFIG = RTCConfiguration({
+    "iceServers": [
+        {
+            "urls": [
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302",
+                "stun:stun2.l.google.com:19302",
+                "stun:stun3.l.google.com:19302",
+            ]
+        },
+        {
+            "urls": [
+                f"turn:{_TURN_HOST}:80",
+                f"turn:{_TURN_HOST}:443",
+                f"turn:{_TURN_HOST}:443?transport=tcp",
+            ],
+            "username":   _TURN_USER,
+            "credential": _TURN_PASS,
+        },
+    ]
+})
 
 # ── Pose utilities ────────────────────────────────────────────────────────────
 LM = {
@@ -158,13 +207,13 @@ def _angle_score(best, ideal, worst):
 # ── Rep counter ───────────────────────────────────────────────────────────────
 class RepCounter:
     def __init__(self, up_thresh, down_thresh, higher_is_up=True):
-        self.up_thresh    = up_thresh
-        self.down_thresh  = down_thresh
-        self.higher_is_up = higher_is_up
-        self.count        = 0
-        self.stage        = None
-        self.history      = deque(maxlen=2000)
-        self._rep_best    = None
+        self.up_thresh     = up_thresh
+        self.down_thresh   = down_thresh
+        self.higher_is_up  = higher_is_up
+        self.count         = 0
+        self.stage         = None
+        self.history       = deque(maxlen=2000)
+        self._rep_best     = None
         self._angle_scores = []
 
     def update(self, v):
@@ -204,7 +253,7 @@ class SquatAnalyzer:
         rep = self.rc.update(ang)
         if rep == 'rep' and self.rc._rep_best is not None:
             self.rc._angle_scores.append(_angle_score(self.rc._rep_best, 70, 160))
-        fb = ('Go lower!'       if ang > 110 and self.rc.stage != 'down'
+        fb = ('Go lower!'           if ang > 110 and self.rc.stage != 'down'
               else 'Good depth! 🔥' if ang < 90
               else 'Stand tall!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
@@ -221,7 +270,7 @@ class PushUpAnalyzer:
         rep = self.rc.update(ang)
         if rep == 'rep' and self.rc._rep_best is not None:
             self.rc._angle_scores.append(_angle_score(self.rc._rep_best, 60, 155))
-        fb = ('Lower chest!'    if ang > 130 and self.rc.stage != 'down'
+        fb = ('Lower chest!'        if ang > 130 and self.rc.stage != 'down'
               else 'Good depth! 🔥' if ang < 90
               else 'Push up!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
@@ -238,8 +287,8 @@ class PullUpAnalyzer:
         rep = self.rc.update(ang)
         if rep == 'rep' and self.rc._rep_best is not None:
             self.rc._angle_scores.append(_angle_score(self.rc._rep_best, 30, 140))
-        fb = ('Pull higher!'        if ang > 70 and self.rc.stage == 'up'
-              else 'Chin over bar! 🔥' if ang < 50
+        fb = ('Pull higher!'            if ang > 70 and self.rc.stage == 'up'
+              else 'Chin over bar! 🔥'  if ang < 50
               else 'Lower slowly!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
                     feedback=fb, form_score=self.rc.angle_score())
@@ -273,10 +322,10 @@ class RussianTwistAnalyzer:
         rhi = lm_px(lms, LM['r_hip'],     w, h)
         lwr = lm_px(lms, LM['l_wrist'],   w, h)
         rwr = lm_px(lms, LM['r_wrist'],   w, h)
-        scx = (lsh[0] + rsh[0]) / 2
-        hcx = (lhi[0] + rhi[0]) / 2
-        rot = abs(scx - hcx)
-        wcx = (lwr[0] + rwr[0]) / 2
+        scx  = (lsh[0] + rsh[0]) / 2
+        hcx  = (lhi[0] + rhi[0]) / 2
+        rot  = abs(scx - hcx)
+        wcx  = (lwr[0] + rwr[0]) / 2
         side = 'left' if wcx < hcx else 'right'
         self._touch_max = max(self._touch_max, rot)
         if rot > 30 and side != self._last_side:
@@ -308,57 +357,57 @@ def draw_skeleton(frame, lms, w, h):
     for i in range(33):
         pt = lm_px(lms, i, w, h)
         cv2.circle(frame, pt, 5, (74, 163, 22), -1, cv2.LINE_AA)
-        cv2.circle(frame, pt, 5, (255, 255, 255), 1,  cv2.LINE_AA)
+        cv2.circle(frame, pt, 5, (255, 255, 255),  1, cv2.LINE_AA)
 
 def draw_hud(frame, res, ex_title):
-    H, W = frame.shape[:2]
-    count    = res.get('count', 0)
-    stage    = res.get('stage', '') or ''
+    H, W   = frame.shape[:2]
+    count   = res.get('count', 0)
+    stage   = res.get('stage', '') or ''
     feedback = res.get('feedback', '')
     angle_v  = float(res.get('angle') or 0)
 
     label = ex_title.upper()
     lw, _ = cv2.getTextSize(label, FONT, 0.65, 1)[0]
-    cv2.rectangle(frame, (W//2-lw//2-12, 6), (W//2+lw//2+12, 38), (230, 232, 235), -1)
-    cv2.putText(frame, label, (W//2-lw//2, 30), FONT, 0.65, (0,   0,   0),   3, cv2.LINE_AA)
-    cv2.putText(frame, label, (W//2-lw//2, 30), FONT, 0.65, (74, 163, 22),   1, cv2.LINE_AA)
+    cv2.rectangle(frame, (W//2-lw//2-12, 6), (W//2+lw//2+12, 38), (230,232,235), -1)
+    cv2.putText(frame, label, (W//2-lw//2, 30), FONT, 0.65, (0,  0,  0),  3, cv2.LINE_AA)
+    cv2.putText(frame, label, (W//2-lw//2, 30), FONT, 0.65, (74,163,22),  1, cv2.LINE_AA)
 
-    cv2.rectangle(frame, (8, 48),  (138, 178), (230, 232, 235), -1)
-    cv2.rectangle(frame, (8, 48),  (138, 52),  (74,  163,  22), -1)
-    cv2.putText(frame, 'REPS', (18, 73), FONT, 0.42, (100, 108, 120), 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (8,48),  (138,178), (230,232,235), -1)
+    cv2.rectangle(frame, (8,48),  (138,52),  (74,163,22),   -1)
+    cv2.putText(frame, 'REPS', (18,73), FONT, 0.42, (100,108,120), 1, cv2.LINE_AA)
     cstr = str(count)
     cw, _ = cv2.getTextSize(cstr, FONT, 2.6, 2)[0]
-    cv2.putText(frame, cstr, (73-cw//2, 158), FONT, 2.6, (0,   0,   0),   5, cv2.LINE_AA)
-    cv2.putText(frame, cstr, (73-cw//2, 158), FONT, 2.6, (74, 163, 22),   2, cv2.LINE_AA)
+    cv2.putText(frame, cstr, (73-cw//2,158), FONT, 2.6, (0,  0,  0),  5, cv2.LINE_AA)
+    cv2.putText(frame, cstr, (73-cw//2,158), FONT, 2.6, (74,163,22),  2, cv2.LINE_AA)
 
     sl = stage.upper() if stage else 'READY'
-    sc = (74, 163, 22) if stage == 'up' else (235, 99, 37)
-    cv2.rectangle(frame, (8, 186), (138, 212), sc, -1)
+    sc = (74,163,22) if stage == 'up' else (235,99,37)
+    cv2.rectangle(frame, (8,186), (138,212), sc, -1)
     sw, _ = cv2.getTextSize(sl, FONT, 0.42, 1)[0]
-    cv2.putText(frame, sl, (73-sw//2, 205), FONT, 0.42, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, sl, (73-sw//2,205), FONT, 0.42, (0,0,0), 2, cv2.LINE_AA)
 
-    cv2.rectangle(frame, (W-148, 48), (W-8, 178), (230, 232, 235), -1)
-    cv2.rectangle(frame, (W-148, 48), (W-8, 52),  (235,  99,  37), -1)
-    cv2.putText(frame, 'ANGLE', (W-138, 73), FONT, 0.42, (100, 108, 120), 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (W-148,48), (W-8,178), (230,232,235), -1)
+    cv2.rectangle(frame, (W-148,48), (W-8,52),  (235,99,37),   -1)
+    cv2.putText(frame, 'ANGLE', (W-138,73), FONT, 0.42, (100,108,120), 1, cv2.LINE_AA)
     astr = f'{int(angle_v)} deg'
     aw, _ = cv2.getTextSize(astr, FONT, 0.75, 1)[0]
-    cv2.putText(frame, astr, (W-78-aw//2, 130), FONT, 0.75, (0,   0,   0),   3, cv2.LINE_AA)
-    cv2.putText(frame, astr, (W-78-aw//2, 130), FONT, 0.75, (235, 99,  37),  1, cv2.LINE_AA)
+    cv2.putText(frame, astr, (W-78-aw//2,130), FONT, 0.75, (0,  0,  0),  3, cv2.LINE_AA)
+    cv2.putText(frame, astr, (W-78-aw//2,130), FONT, 0.75, (235,99,37),  1, cv2.LINE_AA)
 
     if feedback:
-        fb = feedback[:58]
+        fb   = feedback[:58]
         fw, fh = cv2.getTextSize(fb, FONT, 0.5, 1)[0]
-        fy2 = H - 12; fy1 = fy2 - fh - 16
-        cv2.rectangle(frame, (W//2-fw//2-18, fy1), (W//2+fw//2+18, fy2), (230, 232, 235), -1)
-        cv2.putText(frame, fb, (W//2-fw//2, fy2-7), FONT, 0.5, (0,   0,   0),   3, cv2.LINE_AA)
-        cv2.putText(frame, fb, (W//2-fw//2, fy2-7), FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        fy2 = H-12; fy1 = fy2-fh-16
+        cv2.rectangle(frame, (W//2-fw//2-18,fy1), (W//2+fw//2+18,fy2), (230,232,235), -1)
+        cv2.putText(frame, fb, (W//2-fw//2,fy2-7), FONT, 0.5, (0,  0,  0),  3, cv2.LINE_AA)
+        cv2.putText(frame, fb, (W//2-fw//2,fy2-7), FONT, 0.5, (255,255,255),1, cv2.LINE_AA)
 
 # ── Shared gym state ──────────────────────────────────────────────────────────
 class GymState:
     def __init__(self):
         self.lock          = threading.Lock()
-        self.result        = {'count': 0, 'stage': '', 'feedback': 'Get in position!',
-                              'angle': 0, 'form_score': 0}
+        self.result        = {'count':0,'stage':'','feedback':'Get in position!',
+                              'angle':0,'form_score':0}
         self.exercise      = 'Squat'
         self.show_skeleton = True
         self.mirror        = True
@@ -371,8 +420,8 @@ class GymState:
             if ex != self.exercise:
                 self.exercise = ex
                 self.analyzer = ANALYZERS[ex]()
-                self.result   = {'count': 0, 'stage': '', 'feedback': 'Get in position!',
-                                 'angle': 0, 'form_score': 0}
+                self.result   = {'count':0,'stage':'','feedback':'Get in position!',
+                                 'angle':0,'form_score':0}
                 self._close_landmarker()
 
     def _close_landmarker(self):
@@ -413,7 +462,8 @@ class GymState:
                     draw_skeleton(frame_bgr, lms, W, H)
                 self.result = self.analyzer.analyze(lms, W, H)
             else:
-                self.result = {**self.result, 'feedback': 'No pose — step back & stand tall'}
+                self.result = {**self.result,
+                               'feedback': 'No pose — step back & stand tall'}
             draw_hud(frame_bgr, self.result, self.exercise)
             return frame_bgr
 
@@ -437,8 +487,8 @@ with st.sidebar:
     if st.button("🔄 Reset Counter", use_container_width=True):
         with gym.lock:
             gym.analyzer.rc.reset()
-            gym.result = {'count': 0, 'stage': '', 'feedback': 'Ready!',
-                          'angle': 0, 'form_score': 0}
+            gym.result = {'count':0,'stage':'','feedback':'Ready!',
+                          'angle':0,'form_score':0}
         st.rerun()
     st.markdown("---")
     st.markdown("**Exercises:**\n🦵 Squat · 💪 Push-Up\n🏋️ Pull-Up · 🙆 Jumping Jack\n🔄 Russian Twist")
@@ -454,10 +504,10 @@ st.caption("MediaPipe Pose Estimation · Select exercise · Allow camera when pr
 col_vid, col_stats = st.columns([3, 1])
 
 with col_stats:
-    rep_ph   = st.empty()
-    stage_ph = st.empty()
-    angle_ph = st.empty()
-    fb_ph    = st.empty()
+    rep_ph    = st.empty()
+    stage_ph  = st.empty()
+    angle_ph  = st.empty()
+    fb_ph     = st.empty()
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
     end_btn_ph = st.empty()
 
@@ -513,16 +563,19 @@ if mode.startswith("📹"):
             img = gym.process_frame(img)
         except Exception as e:
             cv2.putText(img, f"Err:{str(e)[:35]}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
         return VideoFrame.from_ndarray(img, format="bgr24")
 
     with col_vid:
         ctx = webrtc_streamer(
             key=f"gym-{exercise}",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIG,
+            # ↓ Split config: correct type for each side
+            server_rtc_configuration=SERVER_RTC_CONFIG,
+            frontend_rtc_configuration=FRONTEND_RTC_CONFIG,
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+            media_stream_constraints={"video": {"width": 640, "height": 480},
+                                      "audio": False},
             async_processing=True,
             translations={
                 "button.start":                        "▶ Start Camera",
@@ -544,21 +597,27 @@ if mode.startswith("📹"):
 else:
     with col_vid:
         st.markdown("#### 📁 Upload Video for Analysis")
-        uploaded = st.file_uploader("MP4 / AVI / MOV", type=["mp4", "avi", "mov", "mkv"])
+        uploaded = st.file_uploader("MP4 / AVI / MOV",
+                                    type=["mp4", "avi", "mov", "mkv"])
         if uploaded:
             st.video(uploaded)
-            if st.button("🧠 Analyze Video", type="primary", use_container_width=True):
+            if st.button("🧠 Analyze Video", type="primary",
+                         use_container_width=True):
                 import mediapipe as mp
                 from mediapipe.tasks import python as mp_python
-                from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions
-                from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
+                from mediapipe.tasks.python.vision import (
+                    PoseLandmarker, PoseLandmarkerOptions)
+                from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+                    VisionTaskRunningMode)
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
+                with tempfile.NamedTemporaryFile(delete=False,
+                                                 suffix=".mp4") as f:
                     f.write(uploaded.read())
                     tmp_path = f.name
 
                 opts = PoseLandmarkerOptions(
-                    base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+                    base_options=mp_python.BaseOptions(
+                        model_asset_path=MODEL_PATH),
                     running_mode=VisionTaskRunningMode.VIDEO,
                     num_poses=1,
                     min_pose_detection_confidence=0.5,
@@ -575,7 +634,7 @@ else:
                 analyzer = ANALYZERS[exercise]()
                 prog     = st.progress(0, "Processing…")
                 preview  = st.empty()
-                last_res = {'count': 0, 'stage': '', 'feedback': '', 'angle': 0}
+                last_res = {'count':0,'stage':'','feedback':'','angle':0}
                 fidx     = 0
 
                 while True:
@@ -584,24 +643,31 @@ else:
                         break
                     fidx += 1
                     rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                    det    = lm.detect_for_video(mp_img, int(fidx / fps * 1000))
+                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                      data=rgb)
+                    det = lm.detect_for_video(mp_img,
+                                              int(fidx / fps * 1000))
                     if det.pose_landmarks:
                         lms = det.pose_landmarks[0]
                         if show_skeleton:
                             draw_skeleton(frame, lms, vw, vh)
                         last_res = analyzer.analyze(lms, vw, vh)
                     else:
-                        last_res = {**last_res, 'feedback': 'No pose detected'}
+                        last_res = {**last_res,
+                                    'feedback': 'No pose detected'}
                     draw_hud(frame, last_res, exercise)
                     if fidx % 30 == 0 or fidx == tot:
-                        preview.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                      use_container_width=True)
-                        prog.progress(min(fidx / max(tot, 1), 1.0),
-                                      text=f"Frame {fidx}/{tot} — Reps: {last_res['count']}")
+                        preview.image(
+                            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                            use_container_width=True)
+                        prog.progress(
+                            min(fidx / max(tot, 1), 1.0),
+                            text=f"Frame {fidx}/{tot} — Reps: {last_res['count']}")
 
-                cap.release(); lm.close(); os.unlink(tmp_path); prog.empty()
-                st.success(f"✅ Done! **{last_res['count']} reps** in {fidx} frames.")
+                cap.release(); lm.close()
+                os.unlink(tmp_path); prog.empty()
+                st.success(
+                    f"✅ Done! **{last_res['count']} reps** in {fidx} frames.")
                 gym.result = last_res
                 render_stats()
 
@@ -609,4 +675,5 @@ else:
                 if hist:
                     import pandas as pd
                     st.markdown("#### 📈 Angle History")
-                    st.line_chart(pd.DataFrame({'angle': hist}), color="#64ffa0")
+                    st.line_chart(pd.DataFrame({'angle': hist}),
+                                  color="#64ffa0")
