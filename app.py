@@ -2,6 +2,13 @@
 AI Gym Tracker — Streamlit Real-Time App
 Uses streamlit-webrtc for true browser-side web cam (works on Streamlit Cloud)
 Supports: Squat · Push-Up · Pull-Up · Jumping Jack · Russian Twist
+
+FIXES in this version:
+- Added TURN servers (openrelay.metered.ca) for NAT/firewall traversal
+- Added TCP fallback on port 443 for corporate firewalls
+- TURN credentials loaded from env vars (Streamlit secrets) with open fallback
+- Added extra STUN servers for broader coverage
+- Improved ICE connectivity for Streamlit Cloud deployments
 """
 
 import streamlit as st
@@ -64,6 +71,53 @@ def ensure_model():
     return MODEL_PATH
 
 ensure_model()
+
+# ── TURN / ICE configuration ─────────────────────────────────────────────────
+# Credentials are read from Streamlit secrets (or env vars) so you can keep
+# them out of source code when deploying to Streamlit Cloud.
+#
+# In Streamlit Cloud → App settings → Secrets, add:
+#   TURN_SERVER   = "openrelay.metered.ca"   # or your own TURN host
+#   TURN_USERNAME = "openrelayproject"
+#   TURN_CREDENTIAL = "openrelayproject"
+#
+# The open-relay fallback below is fine for development / low-traffic demos.
+# For production traffic, sign up for a free account at https://www.metered.ca/
+# or use Twilio STUN/TURN.
+
+def _turn_secret(key: str, fallback: str) -> str:
+    """Read from st.secrets first, then os.environ, then fallback."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.environ.get(key, fallback)
+
+_TURN_SERVER     = _turn_secret("TURN_SERVER",     "openrelay.metered.ca")
+_TURN_USERNAME   = _turn_secret("TURN_USERNAME",   "openrelayproject")
+_TURN_CREDENTIAL = _turn_secret("TURN_CREDENTIAL", "openrelayproject")
+
+RTC_CONFIG = RTCConfiguration({"iceServers": [
+    # ── STUN (public IP discovery) ──────────────────────────────────────────
+    {"urls": ["stun:stun.l.google.com:19302"]},
+    {"urls": ["stun:stun1.l.google.com:19302"]},
+    {"urls": ["stun:stun2.l.google.com:19302"]},
+    {"urls": ["stun:stun3.l.google.com:19302"]},
+    {"urls": ["stun:stun4.l.google.com:19302"]},
+    # ── TURN (relay — required behind symmetric NAT / corporate firewalls) ──
+    # UDP port 80  – fastest when allowed
+    # TCP port 443 – tunnels through firewalls that block UDP entirely
+    {
+        "urls": [
+            f"turn:{_TURN_SERVER}:80",
+            f"turn:{_TURN_SERVER}:443",
+            f"turn:{_TURN_SERVER}:443?transport=tcp",
+        ],
+        "username":   _TURN_USERNAME,
+        "credential": _TURN_CREDENTIAL,
+    },
+]})
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 LM = {'l_shoulder':11,'r_shoulder':12,'l_elbow':13,'r_elbow':14,'l_wrist':15,'r_wrist':16,
       'l_hip':23,'r_hip':24,'l_knee':25,'r_knee':26,'l_ankle':27,'r_ankle':28}
@@ -280,7 +334,6 @@ gym.mirror = mirror
 st.title("💪 AI Gym Tracker — Real-Time")
 st.caption("MediaPipe Pose Estimation · Select exercise · Allow camera when prompted")
 
-# ── Redirect handler ──
 col_vid, col_stats = st.columns([3,1])
 
 with col_stats:
@@ -321,19 +374,22 @@ if mode.startswith("📹"):
         except Exception as e: cv2.putText(img,f"Err:{str(e)[:35]}",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
         return VideoFrame.from_ndarray(img, format="bgr24")
 
-    RTC_CONFIG = RTCConfiguration({"iceServers":[
-        {"urls":["stun:stun.l.google.com:19302"]},
-        {"urls":["stun:stun1.l.google.com:19302"]},
-    ]})
-
     with col_vid:
         ctx = webrtc_streamer(
             key=f"gym-{exercise}",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIG,
+            rtc_configuration=RTC_CONFIG,          # ← updated config with TURN
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video":{"width":640,"height":480},"audio":False},
+            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
             async_processing=True,
+            translations={
+                "button.start": "▶ Start Camera",
+                "button.stop":  "■ Stop",
+                "message.requesting_camera":        "Requesting camera access…",
+                "message.camera_starting":          "Camera starting…",
+                "message.media_devices_not_found":  "No camera found. Please connect a camera.",
+                "message.media_devices_access_denied": "Camera access denied. Please allow it in browser settings.",
+            },
         )
 
     if ctx.state.playing:
