@@ -1,45 +1,30 @@
 """
-AI Gym Tracker — Streamlit Real-Time App
-Uses streamlit-webrtc for true browser-side web cam (works on Streamlit Cloud)
+AI Gym Tracker — Streamlit Real-Time App  (REDESIGNED)
+Uses streamlit-webrtc for true browser-side webcam (works on Streamlit Cloud)
 Supports: Squat · Push-Up · Pull-Up · Jumping Jack · Russian Twist
 
-FIXES in this version:
-─────────────────────────────────────────────────────────────────────────────
-1. Python 3.12+ / aioice asyncio shutdown crash patched (NoneType event loop).
-   aioice's pending STUN-retry TimerHandles fire after the asyncio UDP
-   transport's _loop is already None.  We monkey-patch _fatal_error to discard
-   those harmless errors instead of raising AttributeError.
-
-2. Correct ICE config for streamlit-webrtc 0.64.5 + aioice 0.10.2:
-   • aioice only uses ONE stun_server and ONE turn_server (first-match wins).
-   • server_rtc_configuration  → aiortc RTCConfiguration object (Python side).
-     Streamlit Cloud has direct internet access so STUN is enough here, but we
-     also add the TCP TURN as a single-entry fallback for aioice.
-   • frontend_rtc_configuration → TypedDict / plain dict (browser side).
-     The browser's native WebRTC handles multiple servers and ?transport=tcp
-     properly, so we give it the full list including all UDP+TCP TURN URLs.
-   • rtc_configuration is intentionally NOT set — using the split approach
-     avoids the shared-config bug that sends the wrong type to each side.
-
-3. TURN credentials loaded from st.secrets / env vars with open-relay fallback.
-─────────────────────────────────────────────────────────────────────────────
+Features:
+  • Real-time pose estimation via MediaPipe Heavy model
+  • Per-rep form scoring & error history panel
+  • Exercise mismatch detection / warning
+  • Professional dark-sport UI (Inter + monospace numerals)
+  • Angle history chart after video-upload analysis
 """
 
-# ── Asyncio / aioice Python-3.12+ shutdown patch ─────────────────────────────
-# Must run BEFORE any streamlit_webrtc / aioice import.
+# ── asyncio / aioice Python-3.12+ shutdown patch ─────────────────────────────
 import asyncio.selector_events as _sel
 
-_orig_fatal = _sel._SelectorDatagramTransport._fatal_error  # type: ignore[attr-defined]
+_orig_fatal = _sel._SelectorDatagramTransport._fatal_error
 
 def _patched_fatal_error(self, exc, message="Fatal error on transport"):
     if self._loop is None:
-        return  # event loop already gone — discard harmless cleanup error
+        return
     try:
         _orig_fatal(self, exc, message)
     except Exception:
         pass
 
-_sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error  # type: ignore[attr-defined]
+_sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -54,44 +39,298 @@ from av import VideoFrame
 from aiortc import RTCConfiguration as AioRTCConfiguration, RTCIceServer
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Gym Tracker",
-    page_icon="💪",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ── Global CSS — dark sport aesthetic ─────────────────────────────────────────
 st.markdown("""
 <style>
-body, .stApp { background-color: #f5f6fa; color: #1a1a2e; }
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap');
 
-[data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 1px solid #dde1ea; }
-[data-testid="stSidebar"] * { color: #1a1a2e !important; }
+:root {
+    --bg0:   #0a0c10;
+    --bg1:   #10141c;
+    --bg2:   #171d28;
+    --bg3:   #1e2635;
+    --line:  rgba(255,255,255,0.07);
+    --acc:   #00e5a0;
+    --acc2:  #ff5c3a;
+    --acc3:  #ffce3a;
+    --txt:   #e8ecf2;
+    --muted: #6b7a92;
+    --font:  'Barlow', sans-serif;
+    --cond:  'Barlow Condensed', sans-serif;
+    --mono:  'JetBrains Mono', monospace;
+}
+
+html, body, .stApp { background: var(--bg0) !important; color: var(--txt) !important; font-family: var(--font); }
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: var(--bg1) !important;
+    border-right: 1px solid var(--line) !important;
+}
+[data-testid="stSidebar"] * { color: var(--txt) !important; font-family: var(--font) !important; }
 [data-testid="stSidebar"] h1,
 [data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3,
-[data-testid="stSidebar"] .stMarkdown { color: #1a1a2e !important; }
-[data-testid="stSidebar"] hr { border-color: #dde1ea !important; }
-[data-testid="stSidebar"] .stSelectbox label,
-[data-testid="stSidebar"] .stRadio label,
-[data-testid="stSidebar"] .stCheckbox label { color: #1a1a2e !important; }
-[data-testid="stSidebar"] [data-baseweb="select"] > div { background-color: #f5f6fa !important; border-color: #dde1ea !important; color: #1a1a2e !important; }
-[data-testid="stSidebar"] [data-baseweb="select"] span { color: #1a1a2e !important; }
-[data-testid="stSidebar"] [role="radiogroup"] label { color: #1a1a2e !important; }
-[data-testid="stSidebar"] .stButton > button { background-color: #f0f4f8 !important; color: #1a1a2e !important; border: 1px solid #dde1ea !important; border-radius: 10px !important; }
-[data-testid="stSidebar"] .stButton > button:hover { background-color: #e2e8f0 !important; }
-[data-testid="stSidebar"] .stButton > button[kind="primary"] { background-color: #16a34a !important; color: #ffffff !important; border: none !important; }
-[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover { background-color: #15803d !important; }
+[data-testid="stSidebar"] h3 {
+    font-family: var(--cond) !important;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+[data-testid="stSidebar"] hr { border-color: var(--line) !important; }
 
-.metric-card { background:#ffffff; border-radius:14px; padding:18px 22px; border:1px solid #dde1ea; box-shadow:0 2px 8px rgba(0,0,0,0.06); text-align:center; margin-bottom:10px; }
-.metric-value { font-size:3rem; font-weight:800; color:#16a34a; line-height:1.1; }
-.metric-label { font-size:0.82rem; color:#6b7280; letter-spacing:1.5px; text-transform:uppercase; margin-top:4px; }
-.feedback-box { background:#ffffff; border-left:4px solid #16a34a; border-radius:10px; padding:12px 18px; margin-top:10px; font-size:1.05rem; color:#1a1a2e; box-shadow:0 2px 8px rgba(0,0,0,0.06); }
-.score-bar-bg { background:#e5e7eb; border-radius:8px; height:14px; margin:6px 0; }
-.score-bar-fill { background:#16a34a; height:14px; border-radius:8px; }
-h1 { color:#16a34a !important; }
+[data-testid="stSidebar"] [data-baseweb="select"] > div {
+    background: var(--bg2) !important;
+    border-color: var(--line) !important;
+    color: var(--txt) !important;
+    border-radius: 6px !important;
+}
+[data-testid="stSidebar"] [data-baseweb="select"] span { color: var(--txt) !important; }
+[data-testid="stSidebar"] [role="radiogroup"] label { color: var(--txt) !important; }
+
+/* primary button (Reset) */
+[data-testid="stSidebar"] .stButton > button {
+    background: var(--bg2) !important;
+    color: var(--txt) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 6px !important;
+    font-family: var(--cond) !important;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    font-size: 13px !important;
+    transition: background .15s, border-color .15s;
+}
+[data-testid="stSidebar"] .stButton > button:hover {
+    background: var(--bg3) !important;
+    border-color: var(--acc) !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: var(--acc) !important;
+    color: #000 !important;
+    border: none !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+    opacity: .88;
+}
+
+/* ── Main area ── */
+.block-container { padding-top: 1.4rem !important; padding-bottom: 2rem !important; }
+
+/* Page title */
+h1 { font-family: var(--cond) !important; font-size: 2.4rem !important; font-weight: 900 !important;
+     letter-spacing: 3px; text-transform: uppercase; color: var(--acc) !important; margin-bottom: 0 !important; }
+.subtitle { font-family: var(--font); font-size: 13px; color: var(--muted); letter-spacing: .5px; margin-top: -6px; }
+
+/* ── Warning box ── */
+.warn-mismatch {
+    background: rgba(255,92,58,0.10);
+    border: 1px solid rgba(255,92,58,0.45);
+    border-left: 4px solid var(--acc2);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 10px 0 16px;
+    font-size: 13.5px;
+    color: #ffc4b8;
+    line-height: 1.55;
+}
+.warn-mismatch strong { color: var(--acc2); }
+.warn-ok {
+    background: rgba(0,229,160,0.08);
+    border: 1px solid rgba(0,229,160,0.3);
+    border-left: 4px solid var(--acc);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin: 10px 0 16px;
+    font-size: 13px;
+    color: #9de8cc;
+}
+
+/* ── Metric cards ── */
+.metric-row { display: flex; gap: 10px; margin-bottom: 12px; }
+.metric-card {
+    flex: 1;
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 10px 12px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+}
+.metric-card::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: var(--acc);
+}
+.metric-card.orange::before { background: var(--acc2); }
+.metric-card.blue::before   { background: #4e8ef7; }
+.metric-card.yellow::before { background: var(--acc3); }
+.metric-value {
+    font-family: var(--mono);
+    font-size: 2.4rem;
+    font-weight: 700;
+    color: var(--acc);
+    line-height: 1.1;
+    letter-spacing: -1px;
+}
+.metric-card.orange .metric-value { color: var(--acc2); }
+.metric-card.blue   .metric-value { color: #4e8ef7; }
+.metric-card.yellow .metric-value { color: var(--acc3); }
+.metric-label {
+    font-family: var(--cond);
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-top: 4px;
+}
+
+/* ── Feedback box ── */
+.feedback-card {
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 14px;
+    color: var(--txt);
+    line-height: 1.5;
+    margin-bottom: 12px;
+}
+.feedback-card .fb-label {
+    font-family: var(--cond);
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 4px;
+}
+.feedback-card .fb-msg { color: var(--acc); font-weight: 600; }
+
+/* ── History panel ── */
+.hist-header {
+    font-family: var(--cond);
+    font-size: 13px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 8px;
+    margin-bottom: 10px;
+}
+.hist-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 12px;
+    margin-bottom: 6px;
+    font-size: 13px;
+}
+.hist-rep-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 28px;
+}
+.hist-bar-bg {
+    flex: 1;
+    background: var(--bg3);
+    border-radius: 4px;
+    height: 6px;
+    overflow: hidden;
+}
+.hist-bar-fill { height: 100%; border-radius: 4px; }
+.hist-score {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 700;
+    min-width: 34px;
+    text-align: right;
+}
+.hist-tag {
+    font-family: var(--cond);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 20px;
+    white-space: nowrap;
+}
+.tag-good   { background: rgba(0,229,160,0.12);  color: var(--acc);  border: 1px solid rgba(0,229,160,0.3);  }
+.tag-ok     { background: rgba(255,206,58,0.12); color: var(--acc3); border: 1px solid rgba(255,206,58,0.3); }
+.tag-poor   { background: rgba(255,92,58,0.12);  color: var(--acc2); border: 1px solid rgba(255,92,58,0.3);  }
+.hist-error-note {
+    font-size: 11px;
+    color: var(--acc2);
+    margin-top: 2px;
+    display: block;
+}
+
+/* ── Session summary ── */
+.session-summary {
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+}
+.sess-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.sess-label { font-family: var(--cond); font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); }
+.sess-val { font-family: var(--mono); font-size: 16px; font-weight: 700; }
+
+/* ── End button ── */
+.end-btn-wrap a {
+    display: block; width: 100%;
+    padding: 11px 0;
+    background: var(--acc);
+    color: #000 !important;
+    text-align: center;
+    border-radius: 8px;
+    font-family: var(--cond);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    text-decoration: none;
+    margin-top: 8px;
+    transition: opacity .15s;
+}
+.end-btn-wrap a:hover { opacity: .85; }
+
+/* ── Exercise tag chips in sidebar ── */
+.ex-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.ex-chip {
+    font-family: var(--cond);
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    padding: 3px 10px;
+    border-radius: 20px;
+}
+
+/* ── Streamlit widget overrides ── */
+.stRadio > label { color: var(--muted) !important; font-size: 13px !important; }
+.stCheckbox > label { color: var(--txt) !important; }
+.stSelectbox > label { color: var(--muted) !important; font-size: 12px !important;
+                        font-family: var(--cond) !important; letter-spacing: 1.5px; text-transform: uppercase; }
+div[data-testid="stCaption"] { color: var(--muted) !important; }
+
+/* ── Line chart override ── */
+[data-testid="stVegaLiteChart"] { background: var(--bg2) !important; border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
+
 
 # ── MediaPipe model ───────────────────────────────────────────────────────────
 MODEL_PATH = "pose_landmarker_heavy.task"
@@ -107,28 +346,9 @@ def ensure_model():
 
 ensure_model()
 
-# ── ICE / TURN configuration ──────────────────────────────────────────────────
-#
-# streamlit-webrtc 0.64.5 exposes THREE separate config params:
-#
-#   server_rtc_configuration   → aiortc RTCConfiguration (Python/aioice)
-#   frontend_rtc_configuration → TypedDict / plain dict  (browser WebRTC)
-#   rtc_configuration          → sets BOTH (use only if types match, they don't)
-#
-# aioice 0.10.2 limitation: connection_kwargs() only uses the FIRST stun_server
-# and the FIRST turn_server it encounters when iterating iceServers.  Extra
-# entries are silently skipped.  So we give the server side one optimised entry.
-#
-# The browser's native WebRTC has no such limitation — it handles the full list
-# including multiple TURN servers and ?transport=tcp properly.
-#
-# To use your own TURN server, set these in Streamlit Cloud → App settings → Secrets:
-#   TURN_SERVER     = "your-host.metered.ca"
-#   TURN_USERNAME   = "your-user"
-#   TURN_CREDENTIAL = "your-credential"
 
+# ── ICE / TURN configuration ──────────────────────────────────────────────────
 def _secret(key: str, fallback: str) -> str:
-    """Read from st.secrets, then os.environ, then fallback."""
     try:
         return st.secrets[key]
     except Exception:
@@ -138,10 +358,8 @@ _TURN_HOST = _secret("TURN_SERVER",     "openrelay.metered.ca")
 _TURN_USER = _secret("TURN_USERNAME",   "openrelayproject")
 _TURN_PASS = _secret("TURN_CREDENTIAL", "openrelayproject")
 
-# Python / aioice side — one STUN + one TURN (TCP on 443, punches through firewalls)
-# aioice only uses the first match per scheme, so one well-chosen entry is enough.
 SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
-    RTCIceServer(urls=[f"stun:stun.l.google.com:19302"]),
+    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
     RTCIceServer(
         urls=[f"turn:{_TURN_HOST}:443?transport=tcp"],
         username=_TURN_USER,
@@ -149,31 +367,24 @@ SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
     ),
 ])
 
-# Browser side — full list; native WebRTC handles all of them correctly.
-# UDP port 80  → fastest when allowed
-# UDP port 443 → often open even on restrictive networks
-# TCP port 443 → tunnels through firewalls that block UDP entirely
 FRONTEND_RTC_CONFIG = RTCConfiguration({
     "iceServers": [
-        {
-            "urls": [
-                "stun:stun.l.google.com:19302",
-                "stun:stun1.l.google.com:19302",
-                "stun:stun2.l.google.com:19302",
-                "stun:stun3.l.google.com:19302",
-            ]
-        },
-        {
-            "urls": [
-                f"turn:{_TURN_HOST}:80",
-                f"turn:{_TURN_HOST}:443",
-                f"turn:{_TURN_HOST}:443?transport=tcp",
-            ],
-            "username":   _TURN_USER,
-            "credential": _TURN_PASS,
+        {"urls": [
+            "stun:stun.l.google.com:19302",
+            "stun:stun1.l.google.com:19302",
+            "stun:stun2.l.google.com:19302",
+        ]},
+        {"urls": [
+            f"turn:{_TURN_HOST}:80",
+            f"turn:{_TURN_HOST}:443",
+            f"turn:{_TURN_HOST}:443?transport=tcp",
+        ],
+         "username":   _TURN_USER,
+         "credential": _TURN_PASS,
         },
     ]
 })
+
 
 # ── Pose utilities ────────────────────────────────────────────────────────────
 LM = {
@@ -204,16 +415,17 @@ def _angle_score(best, ideal, worst):
         return max(0, min(100, int((worst - best) / (worst - ideal) * 100)))
     return max(0, min(100, int((best - worst) / (ideal - worst) * 100)))
 
+
 # ── Rep counter ───────────────────────────────────────────────────────────────
 class RepCounter:
     def __init__(self, up_thresh, down_thresh, higher_is_up=True):
-        self.up_thresh     = up_thresh
-        self.down_thresh   = down_thresh
-        self.higher_is_up  = higher_is_up
-        self.count         = 0
-        self.stage         = None
-        self.history       = deque(maxlen=2000)
-        self._rep_best     = None
+        self.up_thresh    = up_thresh
+        self.down_thresh  = down_thresh
+        self.higher_is_up = higher_is_up
+        self.count        = 0
+        self.stage        = None
+        self.history      = deque(maxlen=2000)
+        self._rep_best    = None
         self._angle_scores = []
 
     def update(self, v):
@@ -241,61 +453,92 @@ class RepCounter:
         self.count = 0; self.stage = None
         self.history.clear(); self._rep_best = None; self._angle_scores = []
 
+
 # ── Exercise analyzers ────────────────────────────────────────────────────────
 class SquatAnalyzer:
-    label = 'Squat'
+    label       = 'Squat'
+    pose_hints  = ['deep knee bend', 'thighs parallel to ground']
+
     def __init__(self): self.rc = RepCounter(160, 90)
+
     def analyze(self, lms, w, h):
         hip   = lm_px(lms, LM['l_hip'],   w, h)
         knee  = lm_px(lms, LM['l_knee'],  w, h)
         ankle = lm_px(lms, LM['l_ankle'], w, h)
         ang = angle3(hip, knee, ankle)
         rep = self.rc.update(ang)
+        error = None
         if rep == 'rep' and self.rc._rep_best is not None:
-            self.rc._angle_scores.append(_angle_score(self.rc._rep_best, 70, 160))
-        fb = ('Go lower!'           if ang > 110 and self.rc.stage != 'down'
-              else 'Good depth! 🔥' if ang < 90
-              else 'Stand tall!')
+            sc = _angle_score(self.rc._rep_best, 70, 160)
+            self.rc._angle_scores.append(sc)
+            if sc < 50:
+                error = "Depth too shallow — go lower next rep"
+        fb = ('Go lower — knees past 90°!'  if ang > 110 and self.rc.stage != 'down'
+              else 'Perfect depth! 🔥'       if ang < 90
+              else 'Drive through heels!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
-                    feedback=fb, form_score=self.rc.angle_score())
+                    feedback=fb, form_score=self.rc.angle_score(),
+                    last_error=error, rep_triggered=(rep == 'rep'))
+
 
 class PushUpAnalyzer:
-    label = 'Push-Up'
+    label       = 'Push-Up'
+    pose_hints  = ['plank position', 'arms bending toward floor']
+
     def __init__(self): self.rc = RepCounter(155, 90)
+
     def analyze(self, lms, w, h):
         sh = lm_px(lms, LM['l_shoulder'], w, h)
         el = lm_px(lms, LM['l_elbow'],   w, h)
         wr = lm_px(lms, LM['l_wrist'],   w, h)
         ang = angle3(sh, el, wr)
         rep = self.rc.update(ang)
+        error = None
         if rep == 'rep' and self.rc._rep_best is not None:
-            self.rc._angle_scores.append(_angle_score(self.rc._rep_best, 60, 155))
-        fb = ('Lower chest!'        if ang > 130 and self.rc.stage != 'down'
-              else 'Good depth! 🔥' if ang < 90
-              else 'Push up!')
+            sc = _angle_score(self.rc._rep_best, 60, 155)
+            self.rc._angle_scores.append(sc)
+            if sc < 50:
+                error = "Elbow angle too high — lower chest to ground"
+        fb = ('Lower chest to floor!'    if ang > 130 and self.rc.stage != 'down'
+              else 'Full range! 🔥'      if ang < 90
+              else 'Push up strong!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
-                    feedback=fb, form_score=self.rc.angle_score())
+                    feedback=fb, form_score=self.rc.angle_score(),
+                    last_error=error, rep_triggered=(rep == 'rep'))
+
 
 class PullUpAnalyzer:
-    label = 'Pull-Up'
+    label       = 'Pull-Up'
+    pose_hints  = ['arms fully extended overhead', 'hanging from bar']
+
     def __init__(self): self.rc = RepCounter(50, 140, higher_is_up=False)
+
     def analyze(self, lms, w, h):
         sh = lm_px(lms, LM['l_shoulder'], w, h)
         el = lm_px(lms, LM['l_elbow'],   w, h)
         wr = lm_px(lms, LM['l_wrist'],   w, h)
         ang = angle3(sh, el, wr)
         rep = self.rc.update(ang)
+        error = None
         if rep == 'rep' and self.rc._rep_best is not None:
-            self.rc._angle_scores.append(_angle_score(self.rc._rep_best, 30, 140))
-        fb = ('Pull higher!'            if ang > 70 and self.rc.stage == 'up'
-              else 'Chin over bar! 🔥'  if ang < 50
-              else 'Lower slowly!')
+            sc = _angle_score(self.rc._rep_best, 30, 140)
+            self.rc._angle_scores.append(sc)
+            if sc < 50:
+                error = "Chin did not clear bar — pull higher"
+        fb = ('Pull higher — chin over bar!'    if ang > 70 and self.rc.stage == 'up'
+              else 'Chin over bar! 🔥'          if ang < 50
+              else 'Lower with control!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
-                    feedback=fb, form_score=self.rc.angle_score())
+                    feedback=fb, form_score=self.rc.angle_score(),
+                    last_error=error, rep_triggered=(rep == 'rep'))
+
 
 class JumpingJackAnalyzer:
-    label = 'Jumping Jack'
+    label       = 'Jumping Jack'
+    pose_hints  = ['arms raised wide', 'feet jumping apart']
+
     def __init__(self): self.rc = RepCounter(130, 40); self._rep_max = 0
+
     def analyze(self, lms, w, h):
         lsh = lm_px(lms, LM['l_shoulder'], w, h)
         lhi = lm_px(lms, LM['l_hip'],     w, h)
@@ -303,18 +546,27 @@ class JumpingJackAnalyzer:
         ang = angle3(lhi, lsh, lwr)
         self._rep_max = max(self._rep_max, ang)
         rep = self.rc.update(ang)
+        error = None
         if rep == 'rep':
-            self.rc._angle_scores.append(_angle_score(self._rep_max, 150, 40))
+            sc = _angle_score(self._rep_max, 150, 40)
+            self.rc._angle_scores.append(sc)
+            if sc < 50:
+                error = "Arms not reaching overhead — extend fully"
             self._rep_max = 0
-        fb = 'Arms up!' if ang < 80 else ('Great! 🔥' if ang > 120 else 'Keep going!')
+        fb = 'Arms overhead!' if ang < 80 else ('Full extension! 🔥' if ang > 120 else 'Keep moving!')
         return dict(angle=ang, stage=self.rc.stage, count=self.rc.count,
-                    feedback=fb, form_score=self.rc.angle_score())
+                    feedback=fb, form_score=self.rc.angle_score(),
+                    last_error=error, rep_triggered=(rep == 'rep'))
+
 
 class RussianTwistAnalyzer:
-    label = 'Russian Twist'
+    label       = 'Russian Twist'
+    pose_hints  = ['seated lean-back', 'hands moving side to side']
+
     def __init__(self):
         self.rc = RepCounter(30, 5)
         self._last_side = None; self._touches = 0; self._touch_max = 0
+
     def analyze(self, lms, w, h):
         lsh = lm_px(lms, LM['l_shoulder'], w, h)
         rsh = lm_px(lms, LM['r_shoulder'], w, h)
@@ -328,16 +580,22 @@ class RussianTwistAnalyzer:
         wcx  = (lwr[0] + rwr[0]) / 2
         side = 'left' if wcx < hcx else 'right'
         self._touch_max = max(self._touch_max, rot)
+        error = None
         if rot > 30 and side != self._last_side:
             self._last_side = side; self._touches += 1
             if self._touches % 2 == 0:
                 self.rc.count += 1
-                self.rc._angle_scores.append(_angle_score(self._touch_max, 80, 0))
+                sc = _angle_score(self._touch_max, 80, 0)
+                self.rc._angle_scores.append(sc)
+                if sc < 50:
+                    error = "Rotation range too small — twist further"
                 self._touch_max = 0
         self.rc.history.append(rot)
-        fb = f'Twist {side}!' if rot < 20 else f'Good twist → {side}! 🔥'
+        fb = f'Twist {side}!' if rot < 20 else f'Good rotation → {side}! 🔥'
         return dict(angle=rot, stage=side, count=self.rc.count,
-                    feedback=fb, form_score=self.rc.angle_score())
+                    feedback=fb, form_score=self.rc.angle_score(),
+                    last_error=error, rep_triggered=False)
+
 
 ANALYZERS = {
     'Squat':         SquatAnalyzer,
@@ -347,81 +605,184 @@ ANALYZERS = {
     'Russian Twist': RussianTwistAnalyzer,
 }
 
+# ── Pose-hint heuristics for exercise mismatch detection ─────────────────────
+# Simple joint-angle heuristics to guess what the person is actually doing.
+def _guess_exercise(lms, w, h) -> str | None:
+    """Return a best-guess exercise name from landmarks, or None if uncertain."""
+    try:
+        hip   = lm_px(lms, LM['l_hip'],   w, h)
+        knee  = lm_px(lms, LM['l_knee'],  w, h)
+        ankle = lm_px(lms, LM['l_ankle'], w, h)
+        sh    = lm_px(lms, LM['l_shoulder'], w, h)
+        el    = lm_px(lms, LM['l_elbow'],   w, h)
+        wr    = lm_px(lms, LM['l_wrist'],   w, h)
+        lhi   = lm_px(lms, LM['l_hip'],     w, h)
+        rhi   = lm_px(lms, LM['r_hip'],     w, h)
+
+        knee_ang  = angle3(hip, knee, ankle)
+        elbow_ang = angle3(sh, el, wr)
+
+        # Wrist height relative to shoulder for overhead arm detection
+        wrist_above_sh = wr[1] < sh[1]
+
+        # Hip height — low hip y means person is lower to ground
+        hip_low = hip[1] > h * 0.6
+
+        # Trunk tilt — shoulder y vs hip y (plank = close vertical distance)
+        sh_y, hi_y = sh[1], ((lhi[1] + rhi[1]) / 2)
+        roughly_horizontal = abs(sh_y - hi_y) < h * 0.15
+
+        if roughly_horizontal and elbow_ang < 130:
+            return 'Push-Up'
+        if wrist_above_sh and not roughly_horizontal:
+            if elbow_ang < 100:
+                return 'Pull-Up'
+            return 'Jumping Jack'
+        if knee_ang < 130 and hip_low:
+            return 'Squat'
+        return None
+    except Exception:
+        return None
+
+
 # ── Drawing helpers ───────────────────────────────────────────────────────────
 FONT = cv2.FONT_HERSHEY_DUPLEX
+ACC_GREEN  = (0, 229, 160)
+ACC_ORANGE = (58, 92, 255)   # BGR
+ACC_RED    = (58, 92, 255)
+WHITE      = (232, 236, 242)
+DARK       = (16, 20, 28)
 
 def draw_skeleton(frame, lms, w, h):
     for a, b in SKELETON_EDGES:
         cv2.line(frame, lm_px(lms, a, w, h), lm_px(lms, b, w, h),
-                 (34, 139, 34), 2, cv2.LINE_AA)
+                 (0, 200, 130), 2, cv2.LINE_AA)
     for i in range(33):
         pt = lm_px(lms, i, w, h)
-        cv2.circle(frame, pt, 5, (74, 163, 22), -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, 5, (0, 229, 160), -1, cv2.LINE_AA)
         cv2.circle(frame, pt, 5, (255, 255, 255),  1, cv2.LINE_AA)
 
-def draw_hud(frame, res, ex_title):
-    H, W   = frame.shape[:2]
-    count   = res.get('count', 0)
-    stage   = res.get('stage', '') or ''
+
+def _pill(frame, text, pos, font_scale=0.5, thickness=1,
+          bg=(30, 38, 55), fg=(232, 236, 242), pad=(10, 6)):
+    """Draw a rounded pill label."""
+    (tw, th), _ = cv2.getTextSize(text, FONT, font_scale, thickness)
+    x, y = pos
+    x1, y1 = x - pad[0], y - th - pad[1]
+    x2, y2 = x + tw + pad[0], y + pad[1]
+    cv2.rectangle(frame, (x1, y1), (x2, y2), bg, -1)
+    cv2.putText(frame, text, (x, y), FONT, font_scale, fg, thickness, cv2.LINE_AA)
+
+
+def draw_hud(frame, res, ex_title, mismatch_ex=None):
+    H, W = frame.shape[:2]
+
+    count    = res.get('count', 0)
+    stage    = res.get('stage', '') or ''
     feedback = res.get('feedback', '')
     angle_v  = float(res.get('angle') or 0)
+    score    = res.get('form_score', 0)
 
+    # Semi-transparent overlay strip top
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (W, 54), (10, 14, 22), -1)
+    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+
+    # Exercise label (top center)
     label = ex_title.upper()
     lw, _ = cv2.getTextSize(label, FONT, 0.65, 1)[0]
-    cv2.rectangle(frame, (W//2-lw//2-12, 6), (W//2+lw//2+12, 38), (230,232,235), -1)
-    cv2.putText(frame, label, (W//2-lw//2, 30), FONT, 0.65, (0,  0,  0),  3, cv2.LINE_AA)
-    cv2.putText(frame, label, (W//2-lw//2, 30), FONT, 0.65, (74,163,22),  1, cv2.LINE_AA)
+    cv2.putText(frame, label, (W//2 - lw//2, 34),
+                FONT, 0.65, (0, 229, 160), 1, cv2.LINE_AA)
 
-    cv2.rectangle(frame, (8,48),  (138,178), (230,232,235), -1)
-    cv2.rectangle(frame, (8,48),  (138,52),  (74,163,22),   -1)
-    cv2.putText(frame, 'REPS', (18,73), FONT, 0.42, (100,108,120), 1, cv2.LINE_AA)
+    # Mismatch warning strip
+    if mismatch_ex:
+        warn_txt = f"! Detected: {mismatch_ex.upper()} — check selection"
+        ww, _ = cv2.getTextSize(warn_txt, FONT, 0.42, 1)[0]
+        cv2.rectangle(frame, (0, 54), (W, 78), (20, 10, 10), -1)
+        cv2.putText(frame, warn_txt, (W//2 - ww//2, 70),
+                    FONT, 0.42, (255, 100, 80), 1, cv2.LINE_AA)
+
+    # Left panel — REPS
+    cv2.rectangle(frame, (8, 60), (130, 185), (16, 22, 34), -1)
+    cv2.rectangle(frame, (8, 60), (130, 64),  (0, 229, 160), -1)
+    cv2.putText(frame, 'REPS', (20, 82), FONT, 0.38, (107, 122, 146), 1, cv2.LINE_AA)
     cstr = str(count)
-    cw, _ = cv2.getTextSize(cstr, FONT, 2.6, 2)[0]
-    cv2.putText(frame, cstr, (73-cw//2,158), FONT, 2.6, (0,  0,  0),  5, cv2.LINE_AA)
-    cv2.putText(frame, cstr, (73-cw//2,158), FONT, 2.6, (74,163,22),  2, cv2.LINE_AA)
+    cw, _ = cv2.getTextSize(cstr, FONT, 2.8, 2)[0]
+    cv2.putText(frame, cstr, (69 - cw//2, 168), FONT, 2.8,
+                (10, 14, 22), 6, cv2.LINE_AA)
+    cv2.putText(frame, cstr, (69 - cw//2, 168), FONT, 2.8,
+                (0, 229, 160), 2, cv2.LINE_AA)
 
+    # Stage chip
     sl = stage.upper() if stage else 'READY'
-    sc = (74,163,22) if stage == 'up' else (235,99,37)
-    cv2.rectangle(frame, (8,186), (138,212), sc, -1)
+    sc = (0, 180, 110) if stage == 'up' else (58, 100, 220)
+    cv2.rectangle(frame, (8, 190), (130, 215), sc, -1)
     sw, _ = cv2.getTextSize(sl, FONT, 0.42, 1)[0]
-    cv2.putText(frame, sl, (73-sw//2,205), FONT, 0.42, (0,0,0), 2, cv2.LINE_AA)
+    cv2.putText(frame, sl, (69 - sw//2, 207), FONT, 0.42, (10, 14, 22), 2, cv2.LINE_AA)
 
-    cv2.rectangle(frame, (W-148,48), (W-8,178), (230,232,235), -1)
-    cv2.rectangle(frame, (W-148,48), (W-8,52),  (235,99,37),   -1)
-    cv2.putText(frame, 'ANGLE', (W-138,73), FONT, 0.42, (100,108,120), 1, cv2.LINE_AA)
-    astr = f'{int(angle_v)} deg'
-    aw, _ = cv2.getTextSize(astr, FONT, 0.75, 1)[0]
-    cv2.putText(frame, astr, (W-78-aw//2,130), FONT, 0.75, (0,  0,  0),  3, cv2.LINE_AA)
-    cv2.putText(frame, astr, (W-78-aw//2,130), FONT, 0.75, (235,99,37),  1, cv2.LINE_AA)
+    # Right panel — ANGLE
+    cv2.rectangle(frame, (W - 138, 60), (W - 8, 185), (16, 22, 34), -1)
+    cv2.rectangle(frame, (W - 138, 60), (W - 8, 64), (255, 92, 58), -1)
+    cv2.putText(frame, 'ANGLE', (W - 128, 82), FONT, 0.38, (107, 122, 146), 1, cv2.LINE_AA)
+    astr = f'{int(angle_v)}'
+    aw, _ = cv2.getTextSize(astr, FONT, 1.8, 2)[0]
+    cv2.putText(frame, astr, (W - 73 - aw//2, 152), FONT, 1.8,
+                (10, 14, 22), 5, cv2.LINE_AA)
+    cv2.putText(frame, astr, (W - 73 - aw//2, 152), FONT, 1.8,
+                (255, 165, 58), 2, cv2.LINE_AA)
+    cv2.putText(frame, 'deg', (W - 73 - aw//2 + aw + 4, 152),
+                FONT, 0.38, (107, 122, 146), 1, cv2.LINE_AA)
 
+    # Form score bar (bottom-left)
+    bar_x, bar_y, bar_w = 8, H - 28, 200
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 10), (22, 30, 44), -1)
+    fill = int(bar_w * score / 100) if score else 0
+    bar_col = (0, 229, 160) if score >= 75 else (58, 200, 255) if score >= 50 else (58, 92, 255)
+    if fill > 0:
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill, bar_y + 10), bar_col, -1)
+    cv2.putText(frame, f'FORM {score}', (bar_x, bar_y - 4),
+                FONT, 0.35, (107, 122, 146), 1, cv2.LINE_AA)
+
+    # Feedback (bottom center)
     if feedback:
-        fb   = feedback[:58]
-        fw, fh = cv2.getTextSize(fb, FONT, 0.5, 1)[0]
-        fy2 = H-12; fy1 = fy2-fh-16
-        cv2.rectangle(frame, (W//2-fw//2-18,fy1), (W//2+fw//2+18,fy2), (230,232,235), -1)
-        cv2.putText(frame, fb, (W//2-fw//2,fy2-7), FONT, 0.5, (0,  0,  0),  3, cv2.LINE_AA)
-        cv2.putText(frame, fb, (W//2-fw//2,fy2-7), FONT, 0.5, (255,255,255),1, cv2.LINE_AA)
+        fb = feedback[:60]
+        fw, fh = cv2.getTextSize(fb, FONT, 0.48, 1)[0]
+        fy = H - 12
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2,
+                      (W//2 - fw//2 - 16, fy - fh - 14),
+                      (W//2 + fw//2 + 16, fy + 4),
+                      (10, 14, 22), -1)
+        cv2.addWeighted(overlay2, 0.88, frame, 0.12, 0, frame)
+        cv2.putText(frame, fb, (W//2 - fw//2, fy),
+                    FONT, 0.48, (0, 229, 160), 1, cv2.LINE_AA)
+
 
 # ── Shared gym state ──────────────────────────────────────────────────────────
 class GymState:
     def __init__(self):
-        self.lock          = threading.Lock()
-        self.result        = {'count':0,'stage':'','feedback':'Get in position!',
-                              'angle':0,'form_score':0}
-        self.exercise      = 'Squat'
-        self.show_skeleton = True
-        self.mirror        = True
-        self.analyzer      = SquatAnalyzer()
-        self._mp           = None
-        self._landmarker   = None
+        self.lock             = threading.Lock()
+        self.result           = {'count': 0, 'stage': '', 'feedback': 'Get in position!',
+                                 'angle': 0, 'form_score': 0,
+                                 'last_error': None, 'rep_triggered': False}
+        self.exercise         = 'Squat'
+        self.show_skeleton    = True
+        self.mirror           = True
+        self.analyzer         = SquatAnalyzer()
+        self.detected_exercise = None      # live pose guess
+        self.rep_history      = []         # list of dicts {rep, score, error}
+        self._mp              = None
+        self._landmarker      = None
 
     def set_exercise(self, ex):
         with self.lock:
             if ex != self.exercise:
-                self.exercise = ex
-                self.analyzer = ANALYZERS[ex]()
-                self.result   = {'count':0,'stage':'','feedback':'Get in position!',
-                                 'angle':0,'form_score':0}
+                self.exercise  = ex
+                self.analyzer  = ANALYZERS[ex]()
+                self.result    = {'count': 0, 'stage': '', 'feedback': 'Get in position!',
+                                  'angle': 0, 'form_score': 0,
+                                  'last_error': None, 'rep_triggered': False}
+                self.rep_history = []
                 self._close_landmarker()
 
     def _close_landmarker(self):
@@ -456,25 +817,190 @@ class GymState:
             rgb    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             det    = landmarker.detect(mp_img)
+
+            mismatch_ex = None
             if det.pose_landmarks:
                 lms = det.pose_landmarks[0]
+                # Heuristic exercise guess
+                guess = _guess_exercise(lms, W, H)
+                self.detected_exercise = guess
+                if guess and guess != self.exercise:
+                    mismatch_ex = guess
+
                 if self.show_skeleton:
                     draw_skeleton(frame_bgr, lms, W, H)
                 self.result = self.analyzer.analyze(lms, W, H)
+
+                # Log rep to history when a rep fires
+                if self.result.get('rep_triggered'):
+                    entry = {
+                        'rep':   self.result['count'],
+                        'score': self.result['form_score'],
+                        'error': self.result.get('last_error'),
+                    }
+                    self.rep_history.append(entry)
             else:
+                self.detected_exercise = None
                 self.result = {**self.result,
-                               'feedback': 'No pose — step back & stand tall'}
-            draw_hud(frame_bgr, self.result, self.exercise)
+                               'feedback': 'No pose — step back & stand tall',
+                               'rep_triggered': False}
+
+            draw_hud(frame_bgr, self.result, self.exercise, mismatch_ex)
             return frame_bgr
+
+    def reset(self):
+        with self.lock:
+            self.analyzer.rc.reset()
+            self.rep_history = []
+            self.result = {'count': 0, 'stage': '', 'feedback': 'Ready!',
+                           'angle': 0, 'form_score': 0,
+                           'last_error': None, 'rep_triggered': False}
+            self.detected_exercise = None
+
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if 'gym_state' not in st.session_state:
     st.session_state.gym_state = GymState()
 gym = st.session_state.gym_state
 
+
+# ── HTML render helpers ───────────────────────────────────────────────────────
+def _score_color_hex(s):
+    if s >= 75: return '#00e5a0'
+    if s >= 50: return '#ffce3a'
+    return '#ff5c3a'
+
+def _score_tag(s):
+    if s >= 75: return '<span class="hist-tag tag-good">Good</span>'
+    if s >= 50: return '<span class="hist-tag tag-ok">Fair</span>'
+    return '<span class="hist-tag tag-poor">Poor</span>'
+
+def render_metric_row(count, stage, angle, score):
+    stage_str = (stage or 'READY').upper()
+    stage_col = '#4e8ef7' if stage_str not in ('UP', 'READY') else '#00e5a0'
+    st.markdown(f"""
+    <div class="metric-row">
+      <div class="metric-card">
+        <div class="metric-value">{count}</div>
+        <div class="metric-label">Reps</div>
+      </div>
+      <div class="metric-card blue">
+        <div class="metric-value" style="color:{stage_col};font-size:1.5rem">{stage_str}</div>
+        <div class="metric-label">Stage</div>
+      </div>
+      <div class="metric-card orange">
+        <div class="metric-value">{int(angle)}°</div>
+        <div class="metric-label">Angle</div>
+      </div>
+      <div class="metric-card yellow">
+        <div class="metric-value" style="color:{_score_color_hex(score)}">{score}</div>
+        <div class="metric-label">Form</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_feedback(fb):
+    if fb:
+        st.markdown(f"""
+        <div class="feedback-card">
+          <div class="fb-label">Feedback</div>
+          <div class="fb-msg">{fb}</div>
+        </div>""", unsafe_allow_html=True)
+
+def render_warning(detected, selected):
+    if detected and detected != selected:
+        st.markdown(f"""
+        <div class="warn-mismatch">
+          ⚠️ &nbsp;<strong>Incorrect exercise selected.</strong><br>
+          Pose detected as <strong>{detected}</strong>, but <strong>{selected}</strong> is active.
+          Please switch the exercise dropdown or adjust your body position.
+        </div>""", unsafe_allow_html=True)
+    elif detected:
+        st.markdown(f"""
+        <div class="warn-ok">
+          ✓ &nbsp;Pose matches <strong>{selected}</strong> — tracking active
+        </div>""", unsafe_allow_html=True)
+
+def render_history_panel(rep_history):
+    total = len(rep_history)
+    avg   = int(sum(r['score'] for r in rep_history) / total) if total else 0
+    errors = [r for r in rep_history if r.get('error')]
+
+    # Session summary
+    avg_col = _score_color_hex(avg) if total else '#6b7a92'
+    st.markdown(f"""
+    <div class="session-summary">
+      <div class="sess-row">
+        <span class="sess-label">Total reps</span>
+        <span class="sess-val" style="color:#00e5a0">{total}</span>
+      </div>
+      <div class="sess-row">
+        <span class="sess-label">Avg form</span>
+        <span class="sess-val" style="color:{avg_col}">{avg if total else '—'}</span>
+      </div>
+      <div class="sess-row">
+        <span class="sess-label">Errors</span>
+        <span class="sess-val" style="color:#ff5c3a">{len(errors)}</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="hist-header">Rep-by-rep history</div>', unsafe_allow_html=True)
+
+    if not rep_history:
+        st.markdown('<p style="color:var(--muted);font-size:13px;padding:8px 0">No reps yet — start exercising.</p>',
+                    unsafe_allow_html=True)
+        return
+
+    for entry in reversed(rep_history[-30:]):
+        sc   = entry['score']
+        err  = entry.get('error')
+        col  = _score_color_hex(sc)
+        tag  = _score_tag(sc)
+        err_html = f'<span class="hist-error-note">↳ {err}</span>' if err else ''
+        st.markdown(f"""
+        <div class="hist-item">
+          <span class="hist-rep-num">R{entry['rep']}</span>
+          <div style="flex:1">
+            <div class="hist-bar-bg">
+              <div class="hist-bar-fill" style="width:{sc}%;background:{col}"></div>
+            </div>
+            {err_html}
+          </div>
+          <span class="hist-score" style="color:{col}">{sc}</span>
+          {tag}
+        </div>""", unsafe_allow_html=True)
+
+
+def render_end_button(score):
+    _url = f"http://localhost/movera/patient/patient-plan.php?score={score}"
+    st.markdown(f"""
+    <div class="end-btn-wrap">
+      <a href="{_url}" target="_blank" rel="noopener noreferrer">
+        End Session &nbsp;·&nbsp; Score: {score}
+      </a>
+    </div>""", unsafe_allow_html=True)
+
+
+def render_stats_panel():
+    res   = gym.result
+    cnt   = res.get('count', 0)
+    stage = res.get('stage', '')
+    ang   = float(res.get('angle') or 0)
+    fb    = res.get('feedback', '')
+    sc    = res.get('form_score', 0)
+    det   = gym.detected_exercise
+
+    render_warning(det, gym.exercise)
+    render_metric_row(cnt, stage, ang, sc)
+    render_feedback(fb)
+    render_history_panel(gym.rep_history)
+    render_end_button(sc)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 💪 AI Gym Tracker")
+    st.markdown("## ⚡ Gym Tracker")
     st.markdown("---")
     exercise = st.selectbox("Exercise", list(ANALYZERS.keys()))
     st.markdown("---")
@@ -484,75 +1010,38 @@ with st.sidebar:
     show_skeleton = st.checkbox("Show Skeleton", value=True)
     mirror        = st.checkbox("Mirror Webcam",  value=True)
     st.markdown("---")
-    if st.button("🔄 Reset Counter", use_container_width=True):
-        with gym.lock:
-            gym.analyzer.rc.reset()
-            gym.result = {'count':0,'stage':'','feedback':'Ready!',
-                          'angle':0,'form_score':0}
+    if st.button("Reset Counter", use_container_width=True):
+        gym.reset()
         st.rerun()
     st.markdown("---")
-    st.markdown("**Exercises:**\n🦵 Squat · 💪 Push-Up\n🏋️ Pull-Up · 🙆 Jumping Jack\n🔄 Russian Twist")
+    st.markdown("""
+    <div class="ex-chips">
+      <span class="ex-chip">Squat</span>
+      <span class="ex-chip">Push-Up</span>
+      <span class="ex-chip">Pull-Up</span>
+      <span class="ex-chip">Jump Jack</span>
+      <span class="ex-chip">Rus. Twist</span>
+    </div>
+    """, unsafe_allow_html=True)
 
 gym.set_exercise(exercise)
 gym.show_skeleton = show_skeleton
 gym.mirror        = mirror
 
-# ── Main layout ───────────────────────────────────────────────────────────────
-st.title("💪 AI Gym Tracker — Real-Time")
-st.caption("MediaPipe Pose Estimation · Select exercise · Allow camera when prompted")
 
-col_vid, col_stats = st.columns([3, 1])
+# ── Page header ───────────────────────────────────────────────────────────────
+st.markdown("# ⚡ AI Gym Tracker")
+st.markdown('<p class="subtitle">MediaPipe Heavy &nbsp;·&nbsp; Real-Time Pose &nbsp;·&nbsp; Form Scoring</p>',
+            unsafe_allow_html=True)
 
-with col_stats:
-    rep_ph    = st.empty()
-    stage_ph  = st.empty()
-    angle_ph  = st.empty()
-    fb_ph     = st.empty()
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    end_btn_ph = st.empty()
+col_vid, col_stats = st.columns([3, 1.6])
 
-def render_stats():
-    res   = gym.result
-    cnt   = res.get('count', 0)
-    s     = (res.get('stage', '') or 'READY').upper()
-    ang   = int(res.get('angle') or 0)
-    fb    = res.get('feedback', '')
-    sc100 = res.get('form_score', 0)
-    sc    = '#16a34a' if s in ('UP', 'READY') else '#2563eb'
-
-    rep_ph.markdown(
-        f'<div class="metric-card">'
-        f'<div class="metric-value">{cnt}</div>'
-        f'<div class="metric-label">Reps</div></div>',
-        unsafe_allow_html=True)
-    stage_ph.markdown(
-        f'<div class="metric-card">'
-        f'<div class="metric-value" style="font-size:1.8rem;color:{sc};">{s}</div>'
-        f'<div class="metric-label">Stage</div></div>',
-        unsafe_allow_html=True)
-    angle_ph.markdown(
-        f'<div class="metric-card">'
-        f'<div class="metric-value" style="color:#28b9ff;">{ang}°</div>'
-        f'<div class="metric-label">Angle</div></div>',
-        unsafe_allow_html=True)
-    if fb:
-        fb_ph.markdown(f'<div class="feedback-box">💬 {fb}</div>',
-                       unsafe_allow_html=True)
-    _url = f"http://localhost/movera/patient/patient-plan.php?score={sc100}"
-    end_btn_ph.markdown(
-        f'<a href="{_url}" target="_blank" rel="noopener noreferrer"'
-        f' style="display:block;width:100%;padding:10px 0;background:#16a34a;color:#fff;'
-        f'text-align:center;border-radius:10px;font-weight:700;font-size:1rem;'
-        f'text-decoration:none;margin-top:8px;">'
-        f'End Exercise (Score: {sc100})</a>',
-        unsafe_allow_html=True)
-
-render_stats()
 
 # ── Webcam mode ───────────────────────────────────────────────────────────────
 if mode.startswith("📹"):
     with col_vid:
-        st.markdown("#### 📹 Live Webcam — Real-Time Tracking")
+        st.markdown('<p style="font-family:var(--cond, sans-serif);font-size:12px;letter-spacing:2px;text-transform:uppercase;color:#6b7a92;margin-bottom:6px">📹 Live Webcam — Real-Time Tracking</p>',
+                    unsafe_allow_html=True)
         st.info("Click **START** → allow camera access → begin exercising!")
 
     def video_frame_callback(frame: VideoFrame) -> VideoFrame:
@@ -562,20 +1051,18 @@ if mode.startswith("📹"):
         try:
             img = gym.process_frame(img)
         except Exception as e:
-            cv2.putText(img, f"Err:{str(e)[:35]}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+            cv2.putText(img, f"Err: {str(e)[:40]}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         return VideoFrame.from_ndarray(img, format="bgr24")
 
     with col_vid:
         ctx = webrtc_streamer(
             key=f"gym-{exercise}",
             mode=WebRtcMode.SENDRECV,
-            # ↓ Split config: correct type for each side
             server_rtc_configuration=SERVER_RTC_CONFIG,
             frontend_rtc_configuration=FRONTEND_RTC_CONFIG,
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": {"width": 640, "height": 480},
-                                      "audio": False},
+            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
             async_processing=True,
             translations={
                 "button.start":                        "▶ Start Camera",
@@ -583,26 +1070,31 @@ if mode.startswith("📹"):
                 "message.requesting_camera":           "Requesting camera access…",
                 "message.camera_starting":             "Camera starting…",
                 "message.media_devices_not_found":     "No camera found.",
-                "message.media_devices_access_denied": "Camera access denied — check browser settings.",
+                "message.media_devices_access_denied": "Camera access denied.",
             },
         )
+
+    with col_stats:
+        render_stats_panel()
 
     if ctx.state.playing:
         import time
         while ctx.state.playing:
-            render_stats()
+            with col_stats:
+                render_stats_panel()
             time.sleep(0.25)
+
 
 # ── Video upload mode ─────────────────────────────────────────────────────────
 else:
     with col_vid:
-        st.markdown("#### 📁 Upload Video for Analysis")
-        uploaded = st.file_uploader("MP4 / AVI / MOV",
+        st.markdown('<p style="font-family:var(--cond,sans-serif);font-size:12px;letter-spacing:2px;text-transform:uppercase;color:#6b7a92;margin-bottom:6px">📁 Upload Video for Analysis</p>',
+                    unsafe_allow_html=True)
+        uploaded = st.file_uploader("MP4 / AVI / MOV / MKV",
                                     type=["mp4", "avi", "mov", "mkv"])
         if uploaded:
             st.video(uploaded)
-            if st.button("🧠 Analyze Video", type="primary",
-                         use_container_width=True):
+            if st.button("Analyze Video", type="primary", use_container_width=True):
                 import mediapipe as mp
                 from mediapipe.tasks import python as mp_python
                 from mediapipe.tasks.python.vision import (
@@ -610,14 +1102,12 @@ else:
                 from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
                     VisionTaskRunningMode)
 
-                with tempfile.NamedTemporaryFile(delete=False,
-                                                 suffix=".mp4") as f:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
                     f.write(uploaded.read())
                     tmp_path = f.name
 
                 opts = PoseLandmarkerOptions(
-                    base_options=mp_python.BaseOptions(
-                        model_asset_path=MODEL_PATH),
+                    base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
                     running_mode=VisionTaskRunningMode.VIDEO,
                     num_poses=1,
                     min_pose_detection_confidence=0.5,
@@ -631,11 +1121,14 @@ else:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                analyzer = ANALYZERS[exercise]()
-                prog     = st.progress(0, "Processing…")
-                preview  = st.empty()
-                last_res = {'count':0,'stage':'','feedback':'','angle':0}
-                fidx     = 0
+                analyzer  = ANALYZERS[exercise]()
+                rep_log   = []   # {rep, score, error}
+                prog      = st.progress(0, "Processing…")
+                preview   = st.empty()
+                last_res  = {'count': 0, 'stage': '', 'feedback': '',
+                             'angle': 0, 'form_score': 0,
+                             'last_error': None, 'rep_triggered': False}
+                fidx = 0
 
                 while True:
                     ret, frame = cap.read()
@@ -643,37 +1136,56 @@ else:
                         break
                     fidx += 1
                     rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
-                                      data=rgb)
-                    det = lm.detect_for_video(mp_img,
-                                              int(fidx / fps * 1000))
+                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    det    = lm.detect_for_video(mp_img, int(fidx / fps * 1000))
+
+                    mismatch_ex = None
                     if det.pose_landmarks:
                         lms = det.pose_landmarks[0]
+                        guess = _guess_exercise(lms, vw, vh)
+                        if guess and guess != exercise:
+                            mismatch_ex = guess
                         if show_skeleton:
                             draw_skeleton(frame, lms, vw, vh)
                         last_res = analyzer.analyze(lms, vw, vh)
+                        if last_res.get('rep_triggered'):
+                            rep_log.append({
+                                'rep':   last_res['count'],
+                                'score': last_res['form_score'],
+                                'error': last_res.get('last_error'),
+                            })
                     else:
-                        last_res = {**last_res,
-                                    'feedback': 'No pose detected'}
-                    draw_hud(frame, last_res, exercise)
+                        last_res = {**last_res, 'feedback': 'No pose detected',
+                                    'rep_triggered': False}
+
+                    draw_hud(frame, last_res, exercise, mismatch_ex)
+
                     if fidx % 30 == 0 or fidx == tot:
-                        preview.image(
-                            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                            use_container_width=True)
-                        prog.progress(
-                            min(fidx / max(tot, 1), 1.0),
-                            text=f"Frame {fidx}/{tot} — Reps: {last_res['count']}")
+                        preview.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                      use_container_width=True)
+                        prog.progress(min(fidx / max(tot, 1), 1.0),
+                                      text=f"Frame {fidx}/{tot} — Reps: {last_res['count']}")
 
                 cap.release(); lm.close()
                 os.unlink(tmp_path); prog.empty()
-                st.success(
-                    f"✅ Done! **{last_res['count']} reps** in {fidx} frames.")
-                gym.result = last_res
-                render_stats()
+                st.success(f"✅ Done! **{last_res['count']} reps** detected in {fidx} frames.")
+
+                # Push results to gym state for the stats panel
+                gym.result      = last_res
+                gym.rep_history = rep_log
+
+                with col_stats:
+                    render_stats_panel()
 
                 hist = list(analyzer.rc.history)
                 if hist:
                     import pandas as pd
-                    st.markdown("#### 📈 Angle History")
-                    st.line_chart(pd.DataFrame({'angle': hist}),
-                                  color="#64ffa0")
+                    st.markdown(
+                        '<p style="font-family:var(--cond,sans-serif);font-size:12px;'
+                        'letter-spacing:2px;text-transform:uppercase;color:#6b7a92;'
+                        'margin:16px 0 6px">📈 Angle History</p>',
+                        unsafe_allow_html=True)
+                    st.line_chart(pd.DataFrame({'angle': hist}), color="#00e5a0")
+
+    with col_stats:
+        render_stats_panel()
