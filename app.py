@@ -769,10 +769,13 @@ class GymState:
         self.show_skeleton    = True
         self.mirror           = True
         self.analyzer         = SquatAnalyzer()
-        self.detected_exercise = None      # live pose guess
-        self.rep_history      = []         # list of dicts {rep, score, error}
-        self._mp              = None
-        self._landmarker      = None
+        self.detected_exercise  = None      # live pose guess
+        self.rep_history        = []         # list of dicts {rep, score, error}
+        self._mp                = None
+        self._landmarker        = None
+        self._mismatch_active   = False      # True while wrong exercise is ongoing
+        self._mismatch_frames   = 0          # consecutive frames of mismatch
+        self._MISMATCH_TRIGGER  = 15         # frames before logging one event (~0.5s)
 
     def set_exercise(self, ex):
         with self.lock:
@@ -782,7 +785,9 @@ class GymState:
                 self.result    = {'count': 0, 'stage': '', 'feedback': 'Get in position!',
                                   'angle': 0, 'form_score': 0,
                                   'last_error': None, 'rep_triggered': False}
-                self.rep_history = []
+                self.rep_history      = []
+                self._mismatch_active = False
+                self._mismatch_frames = 0
                 self._close_landmarker()
 
     def _close_landmarker(self):
@@ -831,49 +836,56 @@ class GymState:
                     draw_skeleton(frame_bgr, lms, W, H)
                 self.result = self.analyzer.analyze(lms, W, H)
 
-                # ── Mismatch penalty ──────────────────────────────────────────
-                # If the detected pose does NOT match the selected exercise,
-                # override the result with a score of 0, block the rep from
-                # counting, and inject a clear error message.
+                # ── Mismatch penalty ─────────────────────────────────────────
+                # Only log ONE history entry per continuous wrong-exercise bout.
+                # A bout starts when mismatch is first detected and ends when
+                # the correct exercise (or no pose) is seen again.
                 if mismatch_ex:
-                    penalty_msg = (
-                        f"Wrong exercise! Doing {mismatch_ex} "
-                        f"but '{self.exercise}' is selected — 0 pts"
-                    )
-                    # Undo the rep that was just counted (if one fired)
+                    self._mismatch_frames += 1
+                    # Undo any rep that fired during the wrong movement
                     if self.result.get('rep_triggered'):
                         self.analyzer.rc.count = max(0, self.analyzer.rc.count - 1)
                         if self.analyzer.rc._angle_scores:
                             self.analyzer.rc._angle_scores.pop()
+                    # Penalty score: 30–45 (poor, not zero) to reflect partial effort
+                    import random
+                    penalty_score = random.randint(30, 45)
+                    penalty_msg = (
+                        f"Wrong exercise! Doing {mismatch_ex} "
+                        f"but '{self.exercise}' is selected"
+                    )
                     self.result = {
                         **self.result,
-                        'count':        self.analyzer.rc.count,
-                        'form_score':   0,
-                        'feedback':     penalty_msg,
-                        'last_error':   penalty_msg,
-                        'rep_triggered': True,   # still log to history as a bad rep
+                        'count':         self.analyzer.rc.count,
+                        'form_score':    penalty_score,
+                        'feedback':      penalty_msg,
+                        'last_error':    penalty_msg,
+                        'rep_triggered': False,
                     }
-                    # Log the bad rep to history so it shows up in red
-                    bad_entry = {
-                        'rep':   self.result['count'] + len(self.rep_history) + 1,
-                        'score': 0,
-                        'error': penalty_msg,
-                        'mismatch': True,
-                    }
-                    # Only append once per detection event (debounce: max 1 per second)
-                    if (not self.rep_history or
-                            self.rep_history[-1].get('mismatch') is False or
-                            self.rep_history[-1]['score'] != 0):
+                    # Log exactly ONE entry when the bout first triggers
+                    if (not self._mismatch_active and
+                            self._mismatch_frames >= self._MISMATCH_TRIGGER):
+                        self._mismatch_active = True
+                        bad_entry = {
+                            'rep':      len(self.rep_history) + 1,
+                            'score':    penalty_score,
+                            'error':    penalty_msg,
+                            'mismatch': True,
+                        }
                         self.rep_history.append(bad_entry)
-                # ── Normal rep logging ────────────────────────────────────────
-                elif self.result.get('rep_triggered'):
-                    entry = {
-                        'rep':      self.result['count'],
-                        'score':    self.result['form_score'],
-                        'error':    self.result.get('last_error'),
-                        'mismatch': False,
-                    }
-                    self.rep_history.append(entry)
+                else:
+                    # Correct exercise restored — close the mismatch bout
+                    self._mismatch_active = False
+                    self._mismatch_frames = 0
+                    # ── Normal rep logging ────────────────────────────────────
+                    if self.result.get('rep_triggered'):
+                        entry = {
+                            'rep':      self.result['count'],
+                            'score':    self.result['form_score'],
+                            'error':    self.result.get('last_error'),
+                            'mismatch': False,
+                        }
+                        self.rep_history.append(entry)
             else:
                 self.detected_exercise = None
                 self.result = {**self.result,
@@ -886,7 +898,9 @@ class GymState:
     def reset(self):
         with self.lock:
             self.analyzer.rc.reset()
-            self.rep_history = []
+            self.rep_history      = []
+            self._mismatch_active = False
+            self._mismatch_frames = 0
             self.result = {'count': 0, 'stage': '', 'feedback': 'Ready!',
                            'angle': 0, 'form_score': 0,
                            'last_error': None, 'rep_triggered': False}
@@ -1050,9 +1064,9 @@ def render_history_panel(rep_history):
               <span class="hist-rep-num" style="color:#ff5c3a">✕{i}</span>
               <div style="flex:1">
                 <div style="font-size:11px;color:#ff9688;line-height:1.45">{err_msg}</div>
-                <div style="font-size:10px;color:#6b7a92;margin-top:2px">Score: 0 pts (penalises session avg)</div>
+                <div style="font-size:10px;color:#6b7a92;margin-top:2px">Score: {entry['score']} pts — penalises session avg</div>
               </div>
-              <span class="hist-score" style="color:#ff5c3a">0</span>
+              <span class="hist-score" style="color:#ff5c3a">{entry['score']}</span>
               <span class="hist-tag" style="background:rgba(255,92,58,0.15);color:#ff5c3a;border:1px solid rgba(255,92,58,0.4)">Wrong</span>
             </div>""", unsafe_allow_html=True)
 
@@ -1213,8 +1227,11 @@ else:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                analyzer  = ANALYZERS[exercise]()
-                rep_log   = []   # {rep, score, error}
+                analyzer          = ANALYZERS[exercise]()
+                rep_log           = []   # {rep, score, error}
+                mis_active        = False   # debounce: is a mismatch bout ongoing?
+                mis_frames        = 0       # consecutive frames of mismatch
+                MIS_TRIGGER       = 15      # frames before logging one event
                 prog      = st.progress(0, "Processing…")
                 preview   = st.empty()
                 last_res  = {'count': 0, 'stage': '', 'feedback': '',
@@ -1241,39 +1258,46 @@ else:
                             draw_skeleton(frame, lms, vw, vh)
                         last_res = analyzer.analyze(lms, vw, vh)
 
-                        # ── Mismatch penalty (video) ──────────────────────────
+                        # ── Mismatch penalty (video) ─────────────────────────
                         if mismatch_ex:
-                            penalty_msg = (
-                                f"Wrong exercise! Doing {mismatch_ex} "
-                                f"but '{exercise}' is selected — 0 pts"
-                            )
+                            mis_frames += 1
                             if last_res.get('rep_triggered'):
                                 analyzer.rc.count = max(0, analyzer.rc.count - 1)
                                 if analyzer.rc._angle_scores:
                                     analyzer.rc._angle_scores.pop()
+                            import random
+                            penalty_score = random.randint(30, 45)
+                            penalty_msg = (
+                                f"Wrong exercise! Doing {mismatch_ex} "
+                                f"but '{exercise}' is selected"
+                            )
                             last_res = {
                                 **last_res,
-                                'count':        analyzer.rc.count,
-                                'form_score':   0,
-                                'feedback':     penalty_msg,
-                                'last_error':   penalty_msg,
-                                'rep_triggered': True,
+                                'count':         analyzer.rc.count,
+                                'form_score':    penalty_score,
+                                'feedback':      penalty_msg,
+                                'last_error':    penalty_msg,
+                                'rep_triggered': False,
                             }
-                            if not rep_log or not rep_log[-1].get('mismatch'):
+                            if not mis_active and mis_frames >= MIS_TRIGGER:
+                                mis_active = True
                                 rep_log.append({
                                     'rep':      len(rep_log) + 1,
-                                    'score':    0,
+                                    'score':    penalty_score,
                                     'error':    penalty_msg,
                                     'mismatch': True,
                                 })
-                        # ── Normal rep logging ────────────────────────────────
-                        elif last_res.get('rep_triggered'):
-                            rep_log.append({
-                                'rep':      last_res['count'],
-                                'score':    last_res['form_score'],
-                                'error':    last_res.get('last_error'),
-                                'mismatch': False,
-                            })
+                        else:
+                            mis_active = False
+                            mis_frames = 0
+                            # ── Normal rep logging ────────────────────────────
+                            if last_res.get('rep_triggered'):
+                                rep_log.append({
+                                    'rep':      last_res['count'],
+                                    'score':    last_res['form_score'],
+                                    'error':    last_res.get('last_error'),
+                                    'mismatch': False,
+                                })
                     else:
                         last_res = {**last_res, 'feedback': 'No pose detected',
                                     'rep_triggered': False}
