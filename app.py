@@ -957,74 +957,121 @@ def render_warning(detected, selected):
         </div>""", unsafe_allow_html=True)
 
 def render_history_panel(rep_history):
-    # Only count real reps (not mismatch events) for totals
-    real_reps  = [r for r in rep_history if not r.get('mismatch')]
-    mis_events = [r for r in rep_history if r.get('mismatch')]
-    total = len(real_reps)
-    avg   = int(sum(r['score'] for r in real_reps) / total) if total else 0
-    errors = [r for r in real_reps if r.get('error')]
+    real_reps   = [r for r in rep_history if not r.get('mismatch')]
+    mis_events  = [r for r in rep_history if r.get('mismatch')]
+    form_errors = [r for r in real_reps if r.get('error')]
+    total_all   = len(rep_history)
+    total_valid = len(real_reps)
 
-    # Session summary
-    avg_col = _score_color_hex(avg) if total else '#6b7a92'
+    # Session score = sum of ALL scores / ALL events (mismatch scores=0 penalise avg)
+    session_score = (
+        int(sum(r['score'] for r in rep_history) / total_all)
+        if total_all else 0
+    )
+    valid_avg = (
+        int(sum(r['score'] for r in real_reps) / total_valid)
+        if total_valid else 0
+    )
+    sc_col  = _score_color_hex(session_score) if total_all else '#6b7a92'
+    avg_col = _score_color_hex(valid_avg)     if total_valid else '#6b7a92'
+
+    # Score breakdown string e.g. "0 + 0 + 89 = 29"
+    breakdown = ' + '.join(str(r['score']) for r in rep_history) if rep_history else '0'
+
     st.markdown(f"""
     <div class="session-summary">
       <div class="sess-row">
-        <span class="sess-label">Valid reps</span>
-        <span class="sess-val" style="color:#00e5a0">{total}</span>
+        <span class="sess-label">Session score</span>
+        <span class="sess-val" style="color:{sc_col};font-size:22px">{session_score if total_all else '—'}</span>
+      </div>
+      <div style="font-size:10px;color:#6b7a92;font-family:var(--mono);margin:-2px 0 8px;word-break:break-all">
+        ({breakdown}) / {total_all if total_all else 1} = {session_score}
+      </div>
+      <div style="height:1px;background:rgba(255,255,255,0.06);margin-bottom:8px"></div>
+      <div class="sess-row">
+        <span class="sess-label" style="font-size:10px">Valid reps</span>
+        <span class="sess-val" style="color:#00e5a0;font-size:14px">{total_valid}</span>
       </div>
       <div class="sess-row">
-        <span class="sess-label">Avg form</span>
-        <span class="sess-val" style="color:{avg_col}">{avg if total else '—'}</span>
+        <span class="sess-label" style="font-size:10px">Valid avg form</span>
+        <span class="sess-val" style="color:{avg_col};font-size:14px">{valid_avg if total_valid else '—'}</span>
       </div>
       <div class="sess-row">
-        <span class="sess-label">Form errors</span>
-        <span class="sess-val" style="color:#ffce3a">{len(errors)}</span>
+        <span class="sess-label" style="font-size:10px">Form errors</span>
+        <span class="sess-val" style="color:#ffce3a;font-size:14px">{len(form_errors)}</span>
       </div>
       <div class="sess-row">
-        <span class="sess-label">Wrong exercise</span>
-        <span class="sess-val" style="color:#ff5c3a">{len(mis_events)}</span>
+        <span class="sess-label" style="font-size:10px">Wrong exercise</span>
+        <span class="sess-val" style="color:#ff5c3a;font-size:14px">{len(mis_events)}</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="hist-header">Rep-by-rep history</div>', unsafe_allow_html=True)
+    # ── Section 1: Rep-by-rep history (valid reps only) ────────────────────
+    st.markdown('<div class="hist-header" style="margin-top:12px">Rep-by-rep history</div>',
+                unsafe_allow_html=True)
 
-    if not rep_history:
-        st.markdown('<p style="color:var(--muted);font-size:13px;padding:8px 0">No reps yet — start exercising.</p>',
+    if not real_reps:
+        st.markdown('<p style="color:var(--muted);font-size:13px;padding:6px 0 4px">No valid reps yet — start exercising.</p>',
                     unsafe_allow_html=True)
-        return
+    else:
+        for entry in reversed(real_reps[-20:]):
+            sc      = entry['score']
+            err     = entry.get('error')
+            col     = _score_color_hex(sc)
+            tag     = _score_tag(sc)
+            border  = 'border-left:3px solid #ffce3a;' if err else ''
+            err_html = f'<span class="hist-error-note">↳ {err}</span>' if err else ''
+            st.markdown(f"""
+            <div class="hist-item" style="{border}">
+              <span class="hist-rep-num">R{entry['rep']}</span>
+              <div style="flex:1">
+                <div class="hist-bar-bg">
+                  <div class="hist-bar-fill" style="width:{sc}%;background:{col}"></div>
+                </div>
+                {err_html}
+              </div>
+              <span class="hist-score" style="color:{col}">{sc}</span>
+              {tag}
+            </div>""", unsafe_allow_html=True)
 
-    for entry in reversed(rep_history[-30:]):
-        sc       = entry['score']
-        err      = entry.get('error')
-        is_mis   = entry.get('mismatch', False)
-        col      = '#ff5c3a' if is_mis else _score_color_hex(sc)
-        tag      = ('<span class="hist-tag" style="background:rgba(255,92,58,0.15);'
-                    'color:#ff5c3a;border:1px solid rgba(255,92,58,0.4)">Wrong exercise</span>')                   if is_mis else _score_tag(sc)
-        err_html = f'<span class="hist-error-note">↳ {err}</span>' if err else ''
-        border   = 'border-left:3px solid #ff5c3a;' if is_mis else ''
-        st.markdown(f"""
-        <div class="hist-item" style="{border}">
-          <span class="hist-rep-num">R{entry['rep']}</span>
-          <div style="flex:1">
-            <div class="hist-bar-bg">
-              <div class="hist-bar-fill" style="width:{sc}%;background:{col}"></div>
-            </div>
-            {err_html}
-          </div>
-          <span class="hist-score" style="color:{col}">{sc}</span>
-          {tag}
-        </div>""", unsafe_allow_html=True)
+    # ── Section 2: Exercise errors (mismatch events) ────────────────────────
+    st.markdown('<div class="hist-header" style="margin-top:14px">Exercise errors</div>',
+                unsafe_allow_html=True)
+
+    if not mis_events:
+        st.markdown('<p style="color:var(--muted);font-size:13px;padding:6px 0 4px">No wrong-exercise events — great discipline!</p>',
+                    unsafe_allow_html=True)
+    else:
+        for i, entry in enumerate(reversed(mis_events[-20:]), 1):
+            err_msg = entry.get('error', 'Wrong exercise detected')
+            st.markdown(f"""
+            <div class="hist-item" style="border-left:3px solid #ff5c3a;">
+              <span class="hist-rep-num" style="color:#ff5c3a">✕{i}</span>
+              <div style="flex:1">
+                <div style="font-size:11px;color:#ff9688;line-height:1.45">{err_msg}</div>
+                <div style="font-size:10px;color:#6b7a92;margin-top:2px">Score: 0 pts (penalises session avg)</div>
+              </div>
+              <span class="hist-score" style="color:#ff5c3a">0</span>
+              <span class="hist-tag" style="background:rgba(255,92,58,0.15);color:#ff5c3a;border:1px solid rgba(255,92,58,0.4)">Wrong</span>
+            </div>""", unsafe_allow_html=True)
 
 
-def render_end_button(score):
-    _url = f"http://localhost/movera/patient/patient-plan.php?score={score}"
+def render_end_button(session_score):
+    _url = f"http://localhost/movera/patient/patient-plan.php?score={session_score}"
     st.markdown(f"""
     <div class="end-btn-wrap">
       <a href="{_url}" target="_blank" rel="noopener noreferrer">
-        End Session &nbsp;·&nbsp; Score: {score}
+        End Session &nbsp;·&nbsp; Score: {session_score}
       </a>
     </div>""", unsafe_allow_html=True)
+
+
+def _calc_session_score(rep_history):
+    """Total score across all events. Wrong-exercise entries count as 0."""
+    if not rep_history:
+        return 0
+    return int(sum(r['score'] for r in rep_history) / len(rep_history))
 
 
 def render_stats_panel():
@@ -1040,8 +1087,8 @@ def render_stats_panel():
     render_metric_row(cnt, stage, ang, sc)
     render_feedback(fb)
     render_history_panel(gym.rep_history)
-    render_end_button(sc)
-
+    session_score = _calc_session_score(gym.rep_history)
+    render_end_button(session_score)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
