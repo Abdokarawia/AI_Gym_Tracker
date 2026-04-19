@@ -831,12 +831,47 @@ class GymState:
                     draw_skeleton(frame_bgr, lms, W, H)
                 self.result = self.analyzer.analyze(lms, W, H)
 
-                # Log rep to history when a rep fires
-                if self.result.get('rep_triggered'):
+                # ── Mismatch penalty ──────────────────────────────────────────
+                # If the detected pose does NOT match the selected exercise,
+                # override the result with a score of 0, block the rep from
+                # counting, and inject a clear error message.
+                if mismatch_ex:
+                    penalty_msg = (
+                        f"Wrong exercise! Doing {mismatch_ex} "
+                        f"but '{self.exercise}' is selected — 0 pts"
+                    )
+                    # Undo the rep that was just counted (if one fired)
+                    if self.result.get('rep_triggered'):
+                        self.analyzer.rc.count = max(0, self.analyzer.rc.count - 1)
+                        if self.analyzer.rc._angle_scores:
+                            self.analyzer.rc._angle_scores.pop()
+                    self.result = {
+                        **self.result,
+                        'count':        self.analyzer.rc.count,
+                        'form_score':   0,
+                        'feedback':     penalty_msg,
+                        'last_error':   penalty_msg,
+                        'rep_triggered': True,   # still log to history as a bad rep
+                    }
+                    # Log the bad rep to history so it shows up in red
+                    bad_entry = {
+                        'rep':   self.result['count'] + len(self.rep_history) + 1,
+                        'score': 0,
+                        'error': penalty_msg,
+                        'mismatch': True,
+                    }
+                    # Only append once per detection event (debounce: max 1 per second)
+                    if (not self.rep_history or
+                            self.rep_history[-1].get('mismatch') is False or
+                            self.rep_history[-1]['score'] != 0):
+                        self.rep_history.append(bad_entry)
+                # ── Normal rep logging ────────────────────────────────────────
+                elif self.result.get('rep_triggered'):
                     entry = {
-                        'rep':   self.result['count'],
-                        'score': self.result['form_score'],
-                        'error': self.result.get('last_error'),
+                        'rep':      self.result['count'],
+                        'score':    self.result['form_score'],
+                        'error':    self.result.get('last_error'),
+                        'mismatch': False,
                     }
                     self.rep_history.append(entry)
             else:
@@ -922,16 +957,19 @@ def render_warning(detected, selected):
         </div>""", unsafe_allow_html=True)
 
 def render_history_panel(rep_history):
-    total = len(rep_history)
-    avg   = int(sum(r['score'] for r in rep_history) / total) if total else 0
-    errors = [r for r in rep_history if r.get('error')]
+    # Only count real reps (not mismatch events) for totals
+    real_reps  = [r for r in rep_history if not r.get('mismatch')]
+    mis_events = [r for r in rep_history if r.get('mismatch')]
+    total = len(real_reps)
+    avg   = int(sum(r['score'] for r in real_reps) / total) if total else 0
+    errors = [r for r in real_reps if r.get('error')]
 
     # Session summary
     avg_col = _score_color_hex(avg) if total else '#6b7a92'
     st.markdown(f"""
     <div class="session-summary">
       <div class="sess-row">
-        <span class="sess-label">Total reps</span>
+        <span class="sess-label">Valid reps</span>
         <span class="sess-val" style="color:#00e5a0">{total}</span>
       </div>
       <div class="sess-row">
@@ -939,8 +977,12 @@ def render_history_panel(rep_history):
         <span class="sess-val" style="color:{avg_col}">{avg if total else '—'}</span>
       </div>
       <div class="sess-row">
-        <span class="sess-label">Errors</span>
-        <span class="sess-val" style="color:#ff5c3a">{len(errors)}</span>
+        <span class="sess-label">Form errors</span>
+        <span class="sess-val" style="color:#ffce3a">{len(errors)}</span>
+      </div>
+      <div class="sess-row">
+        <span class="sess-label">Wrong exercise</span>
+        <span class="sess-val" style="color:#ff5c3a">{len(mis_events)}</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -953,13 +995,16 @@ def render_history_panel(rep_history):
         return
 
     for entry in reversed(rep_history[-30:]):
-        sc   = entry['score']
-        err  = entry.get('error')
-        col  = _score_color_hex(sc)
-        tag  = _score_tag(sc)
+        sc       = entry['score']
+        err      = entry.get('error')
+        is_mis   = entry.get('mismatch', False)
+        col      = '#ff5c3a' if is_mis else _score_color_hex(sc)
+        tag      = ('<span class="hist-tag" style="background:rgba(255,92,58,0.15);'
+                    'color:#ff5c3a;border:1px solid rgba(255,92,58,0.4)">Wrong exercise</span>')                   if is_mis else _score_tag(sc)
         err_html = f'<span class="hist-error-note">↳ {err}</span>' if err else ''
+        border   = 'border-left:3px solid #ff5c3a;' if is_mis else ''
         st.markdown(f"""
-        <div class="hist-item">
+        <div class="hist-item" style="{border}">
           <span class="hist-rep-num">R{entry['rep']}</span>
           <div style="flex:1">
             <div class="hist-bar-bg">
@@ -1148,11 +1193,39 @@ else:
                         if show_skeleton:
                             draw_skeleton(frame, lms, vw, vh)
                         last_res = analyzer.analyze(lms, vw, vh)
-                        if last_res.get('rep_triggered'):
+
+                        # ── Mismatch penalty (video) ──────────────────────────
+                        if mismatch_ex:
+                            penalty_msg = (
+                                f"Wrong exercise! Doing {mismatch_ex} "
+                                f"but '{exercise}' is selected — 0 pts"
+                            )
+                            if last_res.get('rep_triggered'):
+                                analyzer.rc.count = max(0, analyzer.rc.count - 1)
+                                if analyzer.rc._angle_scores:
+                                    analyzer.rc._angle_scores.pop()
+                            last_res = {
+                                **last_res,
+                                'count':        analyzer.rc.count,
+                                'form_score':   0,
+                                'feedback':     penalty_msg,
+                                'last_error':   penalty_msg,
+                                'rep_triggered': True,
+                            }
+                            if not rep_log or not rep_log[-1].get('mismatch'):
+                                rep_log.append({
+                                    'rep':      len(rep_log) + 1,
+                                    'score':    0,
+                                    'error':    penalty_msg,
+                                    'mismatch': True,
+                                })
+                        # ── Normal rep logging ────────────────────────────────
+                        elif last_res.get('rep_triggered'):
                             rep_log.append({
-                                'rep':   last_res['count'],
-                                'score': last_res['form_score'],
-                                'error': last_res.get('last_error'),
+                                'rep':      last_res['count'],
+                                'score':    last_res['form_score'],
+                                'error':    last_res.get('last_error'),
+                                'mismatch': False,
                             })
                     else:
                         last_res = {**last_res, 'feedback': 'No pose detected',
