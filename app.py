@@ -868,11 +868,15 @@ class GymState:
                         self._mismatch_active = True
                         bad_entry = {
                             'rep':      len(self.rep_history) + 1,
-                            'score':    penalty_score,
+                            'score':    penalty_score,   # 30–45 range
                             'error':    penalty_msg,
                             'mismatch': True,
                         }
                         self.rep_history.append(bad_entry)
+                    elif self._mismatch_active:
+                        # Update the last entry's score to current penalty (refresh)
+                        if self.rep_history and self.rep_history[-1].get('mismatch'):
+                            self.rep_history[-1]['score'] = penalty_score
                 else:
                     # Correct exercise restored — close the mismatch bout
                     self._mismatch_active = False
@@ -1058,15 +1062,21 @@ def render_history_panel(rep_history):
                     unsafe_allow_html=True)
     else:
         for i, entry in enumerate(reversed(mis_events[-20:]), 1):
-            err_msg = entry.get('error', 'Wrong exercise detected')
+            raw_msg = entry.get('error', 'Wrong exercise detected')
+            # Strip any legacy "— 0 pts" suffix from old entries
+            err_msg = raw_msg.replace(' — 0 pts', '').replace('— 0 pts', '').strip()
+            sc_entry = entry.get('score', 35)
+            if sc_entry == 0:
+                sc_entry = 35   # upgrade legacy zero entries to fair penalty
+            sc_entry_col = _score_color_hex(sc_entry)
             st.markdown(f"""
             <div class="hist-item" style="border-left:3px solid #ff5c3a;">
               <span class="hist-rep-num" style="color:#ff5c3a">✕{i}</span>
               <div style="flex:1">
                 <div style="font-size:11px;color:#ff9688;line-height:1.45">{err_msg}</div>
-                <div style="font-size:10px;color:#6b7a92;margin-top:2px">Score: {entry['score']} pts — penalises session avg</div>
+                <div style="font-size:10px;color:#6b7a92;margin-top:2px">Score: {sc_entry} pts — penalises session avg</div>
               </div>
-              <span class="hist-score" style="color:#ff5c3a">{entry['score']}</span>
+              <span class="hist-score" style="color:{sc_entry_col}">{sc_entry}</span>
               <span class="hist-tag" style="background:rgba(255,92,58,0.15);color:#ff5c3a;border:1px solid rgba(255,92,58,0.4)">Wrong</span>
             </div>""", unsafe_allow_html=True)
 
@@ -1283,10 +1293,12 @@ else:
                                 mis_active = True
                                 rep_log.append({
                                     'rep':      len(rep_log) + 1,
-                                    'score':    penalty_score,
+                                    'score':    penalty_score,   # 30–45 range
                                     'error':    penalty_msg,
                                     'mismatch': True,
                                 })
+                            elif mis_active and rep_log and rep_log[-1].get('mismatch'):
+                                rep_log[-1]['score'] = penalty_score
                         else:
                             mis_active = False
                             mis_frames = 0
