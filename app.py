@@ -11,20 +11,27 @@ Features:
   • Angle history chart after video-upload analysis
 """
 
-# ── asyncio / aioice Python-3.12+ shutdown patch ─────────────────────────────
-import asyncio.selector_events as _sel
+# ── streamlit-webrtc shutdown-observer defensive patch ───────────────────────
+# Guards against AttributeError: '_polling_thread' when stop() is called
+# before __init__ completes (bug in older streamlit-webrtc on Python 3.12+).
+# Safe no-op if the library version already has the upstream fix (>=0.48).
+try:
+    from streamlit_webrtc.shutdown import SessionShutdownObserver as _SSO
+    _sso_orig_stop = _SSO.stop
 
-_orig_fatal = _sel._SelectorDatagramTransport._fatal_error
+    def _sso_safe_stop(self):
+        if not hasattr(self, "_polling_thread") or self._polling_thread is None:
+            return
+        try:
+            _sso_orig_stop(self)
+        except AttributeError:
+            pass
+        except Exception:
+            pass
 
-def _patched_fatal_error(self, exc, message="Fatal error on transport"):
-    if self._loop is None:
-        return
-    try:
-        _orig_fatal(self, exc, message)
-    except Exception:
-        pass
-
-_sel._SelectorDatagramTransport._fatal_error = _patched_fatal_error
+    _SSO.stop = _sso_safe_stop
+except Exception:
+    pass
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -607,7 +614,7 @@ ANALYZERS = {
 
 # ── Pose-hint heuristics for exercise mismatch detection ─────────────────────
 # Simple joint-angle heuristics to guess what the person is actually doing.
-def _guess_exercise(lms, w, h) -> str | None:
+def _guess_exercise(lms, w, h):
     """Return a best-guess exercise name from landmarks, or None if uncertain."""
     try:
         hip   = lm_px(lms, LM['l_hip'],   w, h)
@@ -1180,14 +1187,6 @@ if mode.startswith("📹"):
             video_frame_callback=video_frame_callback,
             media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
             async_processing=True,
-            translations={
-                "button.start":                        "▶ Start Camera",
-                "button.stop":                         "■ Stop",
-                "message.requesting_camera":           "Requesting camera access…",
-                "message.camera_starting":             "Camera starting…",
-                "message.media_devices_not_found":     "No camera found.",
-                "message.media_devices_access_denied": "Camera access denied.",
-            },
         )
 
     with col_stats:
