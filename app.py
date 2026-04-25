@@ -365,85 +365,97 @@ ensure_model()
 
 
 # ── ICE / TURN configuration ──────────────────────────────────────────────────
-# Priority order:
-#   1) Cloudflare TURN via Hugging Face token (free 10 GB/month)
-#      Uses the new endpoint that replaces the deprecated HF TURN server.
-#   2) Twilio TURN (requires TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN secrets)
-#   3) OpenRelay public TURN (unreliable, last-resort fallback)
+# Uses Metered.ca TURN server. Required because Streamlit Community Cloud
+# blocks direct UDP, so STUN alone cannot establish a peer connection.
+#
+# Streamlit Cloud secrets must contain:
+#   METERED_DOMAIN     = "ai_gym_tracker.metered.live"   (NO https://, no path)
+#   METERED_SECRET_KEY = "your_secret_key"               (server-side only)
+#
+# We do two things:
+#   1) Force-remove HF_TOKEN from env so streamlit-webrtc doesn't trigger
+#      its broken auto-fetch from the deprecated Hugging Face TURN endpoint.
+#   2) Fetch fresh credentials from Metered using the secret key, then build
+#      the standard 4-URL iceServers list Metered recommends.
+import logging
 import urllib.request as _urlreq
-import urllib.error  as _urlerr
+import urllib.parse   as _urlparse
 import json as _json
+
+logging.getLogger("streamlit_webrtc").setLevel(logging.WARNING)
+logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("aiortc").setLevel(logging.WARNING)
+
+# Defensive: scrub HF / Twilio env vars so the library's auto-config can't
+# fire any provider path other than what we explicitly configure below.
+for _bad in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGINGFACEHUB_API_TOKEN",
+             "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
+             "CLOUDFLARE_TURN_KEY_ID", "CLOUDFLARE_TURN_KEY_API_TOKEN"):
+    os.environ.pop(_bad, None)
 
 def _secret(key: str, fallback: str = "") -> str:
     try:
-        return st.secrets[key]
+        v = st.secrets[key]
+        return str(v) if v is not None else fallback
     except Exception:
         return os.environ.get(key, fallback)
 
-_HF_TOKEN     = _secret("HF_TOKEN", "")
-_TWILIO_SID   = _secret("TWILIO_ACCOUNT_SID", "")
-_TWILIO_TOKEN = _secret("TWILIO_AUTH_TOKEN", "")
+_METERED_DOMAIN = _secret("METERED_DOMAIN", "").strip()
+_METERED_SECRET = _secret("METERED_SECRET_KEY", "").strip()
 
-_ice_servers = None  # List[dict] in browser format, or None to fall through
+@st.cache_resource(show_spinner=False)
+def _fetch_metered_ice_servers(domain: str, secret_key: str):
+    """
+    Fetches fresh TURN credentials from Metered, returns the standard
+    4-URL iceServers list ready for RTCConfiguration.
+    Cached for the session — Metered credentials are long-lived by default.
+    """
+    if not domain or not secret_key:
+        raise RuntimeError("METERED_DOMAIN and METERED_SECRET_KEY must be set.")
 
-# --- 1) Cloudflare TURN via HF token (the working endpoint) ---
-def _fetch_cloudflare_via_hf(token: str, ttl: int = 86400):
-    """
-    Hits the Hugging Face → Cloudflare TURN bridge.
-    Returns a list of iceServer dicts ready for RTCConfiguration.
-    """
-    url = "https://fastrtc-turn-server-login.hf.space/credentials"
-    req = _urlreq.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        method="GET",
+    create_url = (f"https://{domain}/api/v1/turn/credential"
+                  f"?secretKey={_urlparse.quote(secret_key, safe='')}")
+    body = _json.dumps({"label": "streamlit-cloud-app"}).encode("utf-8")
+    req  = _urlreq.Request(
+        create_url, data=body, method="POST",
+        headers={"Content-Type": "application/json"},
     )
-    with _urlreq.urlopen(req, timeout=10) as resp:
-        data = _json.loads(resp.read().decode("utf-8"))
-    # Expected shape: {"iceServers":[{"urls":[...], "username":"...", "credential":"..."}]}
-    if isinstance(data, dict) and "iceServers" in data:
-        return data["iceServers"]
-    if isinstance(data, list):
-        return data
-    raise RuntimeError(f"Unexpected TURN payload: {data!r}")
+    with _urlreq.urlopen(req, timeout=15) as resp:
+        cred = _json.loads(resp.read().decode("utf-8"))
 
-if _HF_TOKEN and _ice_servers is None:
-    try:
-        _ice_servers = _fetch_cloudflare_via_hf(_HF_TOKEN)
-        print(f"[ICE] Using Cloudflare TURN via HF token "
-              f"({len(_ice_servers)} servers).")
-    except Exception as _e:
-        print(f"[ICE] Cloudflare-via-HF fetch failed: {_e}")
+    user = cred["username"]
+    pwd  = cred["password"]
 
-# --- 2) Twilio TURN ---
-if _TWILIO_SID and _TWILIO_TOKEN and _ice_servers is None:
-    try:
-        from twilio.rest import Client as _TwilioClient
-        _client = _TwilioClient(_TWILIO_SID, _TWILIO_TOKEN)
-        _tok    = _client.tokens.create()
-        _ice_servers = _tok.ice_servers
-        # Twilio sometimes uses "url" instead of "urls" — normalise
-        for s in _ice_servers:
-            if "url" in s and "urls" not in s:
-                s["urls"] = s.pop("url")
-        print(f"[ICE] Using Twilio TURN ({len(_ice_servers)} servers).")
-    except Exception as _e:
-        print(f"[ICE] Twilio fetch failed: {_e}")
-
-# --- 3) OpenRelay fallback ---
-if _ice_servers is None:
-    _ice_servers = [
-        {"urls": ["stun:stun.l.google.com:19302",
-                  "stun:stun1.l.google.com:19302"]},
-        {"urls": ["turn:openrelay.metered.ca:80",
-                  "turn:openrelay.metered.ca:443",
-                  "turn:openrelay.metered.ca:443?transport=tcp"],
-         "username":  "openrelayproject",
-         "credential": "openrelayproject"},
+    # Standard Metered 4-URL iceServers configuration (covers UDP + TCP + TLS)
+    return [
+        {"urls": "stun:stun.relay.metered.ca:80"},
+        {"urls": f"turn:{domain.split('.')[0]}.relay.metered.ca:80",
+         "username": user, "credential": pwd},
+        {"urls": f"turn:{domain.split('.')[0]}.relay.metered.ca:80?transport=tcp",
+         "username": user, "credential": pwd},
+        {"urls": f"turn:{domain.split('.')[0]}.relay.metered.ca:443",
+         "username": user, "credential": pwd},
+        {"urls": f"turns:{domain.split('.')[0]}.relay.metered.ca:443?transport=tcp",
+         "username": user, "credential": pwd},
     ]
-    print("[ICE] WARNING: using OpenRelay fallback — TURN may be unreliable.")
 
-# --- Build aiortc (server) and browser (frontend) configs ---
+# Build the iceServers list. If Metered fails for any reason we fall back to
+# Google STUN — won't traverse Streamlit Cloud's NAT but app still boots.
+_ice_servers = None
+if _METERED_DOMAIN and _METERED_SECRET:
+    try:
+        _ice_servers = _fetch_metered_ice_servers(_METERED_DOMAIN, _METERED_SECRET)
+        print(f"[ICE] Metered TURN credentials loaded "
+              f"({len(_ice_servers)} ICE servers).")
+    except Exception as _e:
+        print(f"[ICE] Metered fetch failed: {_e}")
+
+if _ice_servers is None:
+    _ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    print("[ICE] WARNING: falling back to Google STUN only — WebRTC will "
+          "likely fail behind Streamlit Cloud's NAT. Check Metered secrets.")
+
+# Build the aiortc (server) and browser (frontend) RTC configs
 def _build_aio_ice(servers):
     out = []
     for s in servers:
