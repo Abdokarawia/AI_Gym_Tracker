@@ -11,25 +11,35 @@ Features:
   • Angle history chart after video-upload analysis
 """
 
-# ── streamlit-webrtc shutdown-observer defensive patch ───────────────────────
-# Guards against AttributeError: '_polling_thread' when stop() is called
-# before __init__ completes (bug in older streamlit-webrtc on Python 3.12+).
-# Safe no-op if the library version already has the upstream fix (>=0.48).
+# ── streamlit-webrtc shutdown-observer defensive patch (STRONG) ──────────────
+# Works around two separate bugs on Python 3.14 / older streamlit-webrtc:
+#   (1) SessionShutdownObserver.stop() called before __init__ assigns
+#       _polling_thread  → AttributeError: '_polling_thread'
+#   (2) _polling_thread is None when stop() runs
+#       → AttributeError: 'NoneType' object has no attribute 'is_alive'
+# The patch fully REPLACES stop() with a version that cannot raise.
 try:
-    from streamlit_webrtc.shutdown import SessionShutdownObserver as _SSO
-    _sso_orig_stop = _SSO.stop
+    from streamlit_webrtc import shutdown as _sw_shutdown
 
     def _sso_safe_stop(self):
-        if not hasattr(self, "_polling_thread") or self._polling_thread is None:
-            return
+        # Swallow everything — this runs during session teardown, so any
+        # failure here produces only log noise, never useful signal.
         try:
-            _sso_orig_stop(self)
-        except AttributeError:
-            pass
+            t = getattr(self, "_polling_thread", None)
+            if t is not None and hasattr(t, "is_alive"):
+                try:
+                    if t.is_alive():
+                        stop_event = getattr(self, "_stop", None)
+                        if stop_event is not None and hasattr(stop_event, "set"):
+                            stop_event.set()
+                        if hasattr(t, "join"):
+                            t.join(timeout=1.0)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    _SSO.stop = _sso_safe_stop
+    _sw_shutdown.SessionShutdownObserver.stop = _sso_safe_stop
 except Exception:
     pass
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,42 +365,71 @@ ensure_model()
 
 
 # ── ICE / TURN configuration ──────────────────────────────────────────────────
-def _secret(key: str, fallback: str) -> str:
+# Priority order:
+#   1) Hugging Face free TURN (requires HF_TOKEN secret) — RECOMMENDED
+#   2) Twilio TURN (requires TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN secrets)
+#   3) OpenRelay public TURN (unreliable, last-resort fallback)
+def _secret(key: str, fallback: str = "") -> str:
     try:
         return st.secrets[key]
     except Exception:
         return os.environ.get(key, fallback)
 
-_TURN_HOST = _secret("TURN_SERVER",     "openrelay.metered.ca")
-_TURN_USER = _secret("TURN_USERNAME",   "openrelayproject")
-_TURN_PASS = _secret("TURN_CREDENTIAL", "openrelayproject")
+_HF_TOKEN      = _secret("HF_TOKEN", "")
+_TWILIO_SID    = _secret("TWILIO_ACCOUNT_SID", "")
+_TWILIO_TOKEN  = _secret("TWILIO_AUTH_TOKEN", "")
 
-SERVER_RTC_CONFIG = AioRTCConfiguration(iceServers=[
-    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-    RTCIceServer(
-        urls=[f"turn:{_TURN_HOST}:443?transport=tcp"],
-        username=_TURN_USER,
-        credential=_TURN_PASS,
-    ),
-])
+_ice_servers = None  # List[dict] in browser format, or None to auto-generate
 
-FRONTEND_RTC_CONFIG = RTCConfiguration({
-    "iceServers": [
-        {"urls": [
-            "stun:stun.l.google.com:19302",
-            "stun:stun1.l.google.com:19302",
-            "stun:stun2.l.google.com:19302",
-        ]},
-        {"urls": [
-            f"turn:{_TURN_HOST}:80",
-            f"turn:{_TURN_HOST}:443",
-            f"turn:{_TURN_HOST}:443?transport=tcp",
-        ],
-         "username":   _TURN_USER,
-         "credential": _TURN_PASS,
-        },
+# --- Try Hugging Face TURN first (preferred) ---
+if _HF_TOKEN and _ice_servers is None:
+    try:
+        from streamlit_webrtc.credentials import get_hf_ice_servers
+        _ice_servers = get_hf_ice_servers(token=_HF_TOKEN)
+    except Exception as _e:
+        print(f"[ICE] HF TURN fetch failed: {_e}")
+
+# --- Fall back to Twilio if configured ---
+if _TWILIO_SID and _TWILIO_TOKEN and _ice_servers is None:
+    try:
+        from streamlit_webrtc.credentials import get_twilio_ice_servers
+        _ice_servers = get_twilio_ice_servers(
+            twilio_sid=_TWILIO_SID, twilio_token=_TWILIO_TOKEN,
+        )
+    except Exception as _e:
+        print(f"[ICE] Twilio TURN fetch failed: {_e}")
+
+# --- Final fallback: OpenRelay (may be unreliable) ---
+if _ice_servers is None:
+    _ice_servers = [
+        {"urls": ["stun:stun.l.google.com:19302",
+                  "stun:stun1.l.google.com:19302"]},
+        {"urls": ["turn:openrelay.metered.ca:80",
+                  "turn:openrelay.metered.ca:443",
+                  "turn:openrelay.metered.ca:443?transport=tcp"],
+         "username": "openrelayproject",
+         "credential": "openrelayproject"},
     ]
-})
+    print("[ICE] WARNING: using OpenRelay fallback — add HF_TOKEN secret for "
+          "reliable connectivity on Streamlit Cloud.")
+
+# Build the server-side aiortc config (Python) and frontend config (browser)
+def _build_aio_ice(servers):
+    out = []
+    for s in servers:
+        urls = s.get("urls")
+        if isinstance(urls, str):
+            urls = [urls]
+        if "username" in s and "credential" in s:
+            out.append(RTCIceServer(urls=urls,
+                                    username=s["username"],
+                                    credential=s["credential"]))
+        else:
+            out.append(RTCIceServer(urls=urls))
+    return out
+
+SERVER_RTC_CONFIG   = AioRTCConfiguration(iceServers=_build_aio_ice(_ice_servers))
+FRONTEND_RTC_CONFIG = RTCConfiguration({"iceServers": _ice_servers})
 
 
 # ── Pose utilities ────────────────────────────────────────────────────────────
