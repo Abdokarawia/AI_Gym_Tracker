@@ -366,40 +366,71 @@ ensure_model()
 
 # ── ICE / TURN configuration ──────────────────────────────────────────────────
 # Priority order:
-#   1) Hugging Face free TURN (requires HF_TOKEN secret) — RECOMMENDED
+#   1) Cloudflare TURN via Hugging Face token (free 10 GB/month)
+#      Uses the new endpoint that replaces the deprecated HF TURN server.
 #   2) Twilio TURN (requires TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN secrets)
 #   3) OpenRelay public TURN (unreliable, last-resort fallback)
+import urllib.request as _urlreq
+import urllib.error  as _urlerr
+import json as _json
+
 def _secret(key: str, fallback: str = "") -> str:
     try:
         return st.secrets[key]
     except Exception:
         return os.environ.get(key, fallback)
 
-_HF_TOKEN      = _secret("HF_TOKEN", "")
-_TWILIO_SID    = _secret("TWILIO_ACCOUNT_SID", "")
-_TWILIO_TOKEN  = _secret("TWILIO_AUTH_TOKEN", "")
+_HF_TOKEN     = _secret("HF_TOKEN", "")
+_TWILIO_SID   = _secret("TWILIO_ACCOUNT_SID", "")
+_TWILIO_TOKEN = _secret("TWILIO_AUTH_TOKEN", "")
 
-_ice_servers = None  # List[dict] in browser format, or None to auto-generate
+_ice_servers = None  # List[dict] in browser format, or None to fall through
 
-# --- Try Hugging Face TURN first (preferred) ---
+# --- 1) Cloudflare TURN via HF token (the working endpoint) ---
+def _fetch_cloudflare_via_hf(token: str, ttl: int = 86400):
+    """
+    Hits the Hugging Face → Cloudflare TURN bridge.
+    Returns a list of iceServer dicts ready for RTCConfiguration.
+    """
+    url = "https://fastrtc-turn-server-login.hf.space/credentials"
+    req = _urlreq.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    with _urlreq.urlopen(req, timeout=10) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    # Expected shape: {"iceServers":[{"urls":[...], "username":"...", "credential":"..."}]}
+    if isinstance(data, dict) and "iceServers" in data:
+        return data["iceServers"]
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(f"Unexpected TURN payload: {data!r}")
+
 if _HF_TOKEN and _ice_servers is None:
     try:
-        from streamlit_webrtc.credentials import get_hf_ice_servers
-        _ice_servers = get_hf_ice_servers(token=_HF_TOKEN)
+        _ice_servers = _fetch_cloudflare_via_hf(_HF_TOKEN)
+        print(f"[ICE] Using Cloudflare TURN via HF token "
+              f"({len(_ice_servers)} servers).")
     except Exception as _e:
-        print(f"[ICE] HF TURN fetch failed: {_e}")
+        print(f"[ICE] Cloudflare-via-HF fetch failed: {_e}")
 
-# --- Fall back to Twilio if configured ---
+# --- 2) Twilio TURN ---
 if _TWILIO_SID and _TWILIO_TOKEN and _ice_servers is None:
     try:
-        from streamlit_webrtc.credentials import get_twilio_ice_servers
-        _ice_servers = get_twilio_ice_servers(
-            twilio_sid=_TWILIO_SID, twilio_token=_TWILIO_TOKEN,
-        )
+        from twilio.rest import Client as _TwilioClient
+        _client = _TwilioClient(_TWILIO_SID, _TWILIO_TOKEN)
+        _tok    = _client.tokens.create()
+        _ice_servers = _tok.ice_servers
+        # Twilio sometimes uses "url" instead of "urls" — normalise
+        for s in _ice_servers:
+            if "url" in s and "urls" not in s:
+                s["urls"] = s.pop("url")
+        print(f"[ICE] Using Twilio TURN ({len(_ice_servers)} servers).")
     except Exception as _e:
-        print(f"[ICE] Twilio TURN fetch failed: {_e}")
+        print(f"[ICE] Twilio fetch failed: {_e}")
 
-# --- Final fallback: OpenRelay (may be unreliable) ---
+# --- 3) OpenRelay fallback ---
 if _ice_servers is None:
     _ice_servers = [
         {"urls": ["stun:stun.l.google.com:19302",
@@ -407,13 +438,12 @@ if _ice_servers is None:
         {"urls": ["turn:openrelay.metered.ca:80",
                   "turn:openrelay.metered.ca:443",
                   "turn:openrelay.metered.ca:443?transport=tcp"],
-         "username": "openrelayproject",
+         "username":  "openrelayproject",
          "credential": "openrelayproject"},
     ]
-    print("[ICE] WARNING: using OpenRelay fallback — add HF_TOKEN secret for "
-          "reliable connectivity on Streamlit Cloud.")
+    print("[ICE] WARNING: using OpenRelay fallback — TURN may be unreliable.")
 
-# Build the server-side aiortc config (Python) and frontend config (browser)
+# --- Build aiortc (server) and browser (frontend) configs ---
 def _build_aio_ice(servers):
     out = []
     for s in servers:
